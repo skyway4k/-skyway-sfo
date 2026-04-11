@@ -1,0 +1,6 @@
+{
+  "name": "skyway",
+  "version": "4.0.0",
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "solclientjs": "^10.18.0", "ws": "^8.16.0" }
+}
