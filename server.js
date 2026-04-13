@@ -54,6 +54,8 @@ async function proxyOsky(apiPath,res){
 const FA_KEY = 'hDZ46pJAZ1aif2ZRFaaIvWVww59ziFiv';
 const FA_BASE = 'https://aeroapi.flightaware.com/aeroapi';
 var faArrivals = [], faDepartures = [], faLastFetch = 0;
+// Persistent cache of all arrived aircraft (accumulates over time, survives refreshes)
+var groundCache = {}; // key: ident, value: arrival data
 
 async function fetchFlightAware(){
   if(Date.now()-faLastFetch < 120000) return; // cache 2 min
@@ -146,7 +148,25 @@ async function fetchFlightAware(){
     function isCoastGuard(id){if(!id)return false;var u=id.toUpperCase();return u.charAt(0)==='C'&&u.length>=5&&u.charAt(1)>='0'&&u.charAt(1)<='9'&&u.charAt(2)>='0'&&u.charAt(2)<='9'&&u.charAt(3)>='0'&&u.charAt(3)<='9'&&u.charAt(4)>='0'&&u.charAt(4)<='9';}
     faArrivals=faArrivals.filter(function(f){return !isCoastGuard(f.ident);});
     faDepartures=faDepartures.filter(function(f){return !isCoastGuard(f.ident);});
-    log('FA: '+faArrivals.length+' arr, '+faDepartures.length+' dep','OK');
+    // Accumulate arrived aircraft into groundCache
+    for(var i=0;i<faArrivals.length;i++){
+      var f=faArrivals[i];
+      if(f.arrived&&f.ident&&f.ident!=='BLOCKED'){
+        groundCache[f.ident.toUpperCase()]={ident:f.ident,callsign:f.callsign,type:f.type,from:f.from,city:f.city,country:f.country,intl:f.intl,
+          arrivedTime:f.arrive,arrivedISO:f.arriveISO,departISO:f.departISO};
+      }
+    }
+    // Remove aircraft that have departed from groundCache
+    for(var i=0;i<faDepartures.length;i++){
+      var f=faDepartures[i];
+      if(f.departed&&f.ident){delete groundCache[f.ident.toUpperCase()];}
+    }
+    // Expire entries older than 30 days
+    var thirtyDaysAgo=Date.now()-(30*24*60*60*1000);
+    for(var k in groundCache){
+      if(groundCache[k].arrivedISO&&new Date(groundCache[k].arrivedISO).getTime()<thirtyDaysAgo)delete groundCache[k];
+    }
+    log('FA: '+faArrivals.length+' arr, '+faDepartures.length+' dep, '+Object.keys(groundCache).length+' on ground','OK');
   }catch(e){log('FA error: '+e.message,'ERR');}
 }
 
@@ -193,46 +213,34 @@ const server = http.createServer(async(req,res)=>{
   }
   if(req.url.startsWith('/osky/')){await proxyOsky(req.url.replace('/osky',''),res);return;}
   if(req.url==='/fa/arrivals'){
+    log('Serving '+faArrivals.length+' arrivals','MSG');
     res.writeHead(200,{'Content-Type':'application/json'});
     res.end(JSON.stringify(faArrivals));return;
   }
-  if(req.url==='/fa/debug'){
-    // Show first 5 arrivals with all ISO fields for debugging
-    var dbg=faArrivals.slice(0,5).map(function(f){return{ident:f.ident,departISO:f.departISO,arriveISO:f.arriveISO,arrived:f.arrived,depart:f.depart,arrive:f.arrive};});
-    res.writeHead(200,{'Content-Type':'application/json'});
-    res.end(JSON.stringify(dbg,null,2));return;
-  }
   if(req.url==='/fa/departures'){
+    log('Serving '+faDepartures.length+' departures','MSG');
     res.writeHead(200,{'Content-Type':'application/json'});
     res.end(JSON.stringify(faDepartures));return;
   }
   if(req.url==='/fa/debug'){
-    var sample=faArrivals.slice(0,5).map(function(f){return{ident:f.ident,departISO:f.departISO,arriveISO:f.arriveISO,depart:f.depart,arrive:f.arrive,arrived:f.arrived};});
+    var dbg=faArrivals.slice(0,5).map(function(f){return{ident:f.ident,departISO:f.departISO,arriveISO:f.arriveISO,arrived:f.arrived,depart:f.depart,arrive:f.arrive,type:f.type};});
     res.writeHead(200,{'Content-Type':'application/json'});
-    res.end(JSON.stringify(sample,null,2));return;
+    res.end(JSON.stringify(dbg,null,2));return;
   }
   if(req.url==='/fa/ground'){
-    // Build set of departed idents
-    var departedIdents={};
-    for(var i=0;i<faDepartures.length;i++){
-      if(faDepartures[i].departed&&faDepartures[i].ident)departedIdents[faDepartures[i].ident.toUpperCase()]=true;
-    }
-    // Only include arrived aircraft that have NOT departed
-    var ground=faArrivals.filter(function(f){
-      if(!f.arrived)return false;
-      var id=(f.ident||'').toUpperCase();
-      return !departedIdents[id];
-    }).map(function(f){
+    // Use groundCache which accumulates all arrived aircraft and removes departed ones
+    var ground=Object.values(groundCache).map(function(f){
+      // Check if there's a scheduled departure for this aircraft
       var dep=null;
       for(var i=0;i<faDepartures.length;i++){
         if(faDepartures[i].ident===f.ident&&!faDepartures[i].departed){dep=faDepartures[i];break;}
       }
       return{ident:f.ident,callsign:f.callsign,type:f.type,from:f.from,city:f.city,country:f.country,intl:f.intl,
-        arrivedTime:f.arrive,arrivedISO:f.arriveISO,departISO:f.departISO,
+        arrivedTime:f.arrivedTime,arrivedISO:f.arrivedISO,departISO:f.departISO,
         nextDest:dep?dep.to:'',nextDepart:dep?dep.depart:'',nextDepartISO:dep?dep.departISO:'',nextDestCity:dep?dep.city:'',
         nextArriveISO:dep?dep.arriveISO:''};
     });
-    // Sort: least time on ground first (most recent arrival at top)
+    // Sort: most recent arrival first
     ground.sort(function(a,b){return(b.arrivedISO||'').localeCompare(a.arrivedISO||'');});
     res.writeHead(200,{'Content-Type':'application/json'});
     res.end(JSON.stringify(ground));return;
@@ -400,14 +408,14 @@ body{font-family:var(--sans);background:var(--b0);color:var(--t1);min-height:100
 .bt{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:1.2px}
 .bt.ar{color:var(--blue)}.bt.de{color:var(--red)}
 .bc{font-family:var(--mono);font-size:11px;font-weight:700;color:var(--t3)}
-.cols{display:grid;grid-template-columns:1fr 1fr 1fr 1fr .3fr 1fr .8fr .6fr;gap:6px;padding:7px 12px;font-family:var(--mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--t3);border-bottom:1px solid var(--bd);text-align:center;background:var(--b2)}
+.cols{display:grid;grid-template-columns:1fr 1fr 1fr 1fr .3fr 1fr .7fr .7fr .5fr;gap:6px;padding:7px 12px;font-family:var(--mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--t3);border-bottom:1px solid var(--bd);text-align:center;background:var(--b2)}
 .cols.ca-done{display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr .8fr;gap:6px;padding:7px 12px;font-family:var(--mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--t3);border-bottom:1px solid var(--bd);text-align:center;background:var(--b2)}
 .cols.cd-done{display:grid;grid-template-columns:1fr 1fr 1fr 1fr .8fr;gap:6px;padding:7px 12px;font-family:var(--mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--t3);border-bottom:1px solid var(--bd);text-align:center;background:var(--b2)}
-.cols.ca{grid-template-columns:1fr 1fr 1fr 1fr .3fr 1fr .8fr .6fr}
+.cols.ca{grid-template-columns:1fr 1fr 1fr 1fr .3fr 1fr .7fr .7fr .5fr}
 .cols.cd{grid-template-columns:1fr 1fr 1fr 1fr .8fr .5fr .5fr .5fr .5fr .5fr}
 .cols span:first-child{text-align:left;padding-left:16px}
 .bb{flex:1;padding:5px 8px}
-.fr{display:grid;grid-template-columns:1fr 1fr 1fr 1fr .3fr 1fr .8fr .6fr;gap:6px;align-items:center;padding:7px 8px;background:var(--b1);border:1px solid var(--bd);border-radius:7px;margin-bottom:3px;cursor:pointer;transition:all .12s;box-shadow:0 1px 2px rgba(0,0,0,.02)}
+.fr{display:grid;grid-template-columns:1fr 1fr 1fr 1fr .3fr 1fr .7fr .7fr .5fr;gap:6px;align-items:center;padding:7px 8px;background:var(--b1);border:1px solid var(--bd);border-radius:7px;margin-bottom:3px;cursor:pointer;transition:all .12s;box-shadow:0 1px 2px rgba(0,0,0,.02)}
 .fr.arr-done{grid-template-columns:1fr 1fr 1fr 1fr 1fr .8fr}
 .fr.dep{grid-template-columns:1fr 1fr 1fr 1fr .8fr .5fr .5fr .5fr .5fr .5fr}
 .fr.dep-simple{grid-template-columns:1fr 1fr 1fr 1fr .8fr}
@@ -419,6 +427,7 @@ body{font-family:var(--sans);background:var(--b0);color:var(--t1);min-height:100
 .fr.dep-gone{background:rgba(220,38,38,.04);border-color:rgba(220,38,38,.12)}
 .chk{width:16px;height:16px;accent-color:var(--green);cursor:pointer;margin:0 auto;display:block}
 .fi{font-family:var(--mono);font-weight:800;font-size:17px;color:var(--cyan);overflow:visible;text-overflow:ellipsis;white-space:nowrap;line-height:1.2;position:relative;padding-left:16px}
+.fi.zp{cursor:pointer}.fi.zp:hover{color:var(--blue);text-decoration:underline}
 .fi .sub{font-size:9px;font-weight:500;color:var(--t3);display:block}
 .ft{font-family:var(--mono);font-size:16px;font-weight:700;color:var(--t1);text-align:center;line-height:1.2}
 .ft .sub{font-size:8px;font-weight:500;color:var(--t3);display:block}
@@ -471,7 +480,7 @@ body{font-family:var(--sans);background:var(--b0);color:var(--t1);min-height:100
 </div>
 <div class="resize-bar" id="resizeBar"><div class="resize-grip"></div></div>
 <div class="boards">
-<div class="board"><div class="bh"><div class="bt ar">🛬 En Route / Scheduled to SFO</div><span class="bc" id="anc">0</span></div><div class="cols ca"><span>Ident</span><span>Type</span><span>From</span><span>Depart</span><span></span><span>Arrive</span><span>ETA</span><span>PAX</span></div><div class="bb" id="ab"></div></div>
+<div class="board"><div class="bh"><div class="bt ar">🛬 En Route / Scheduled to SFO</div><span class="bc" id="anc">0</span></div><div class="cols ca"><span>Ident</span><span>Type</span><span>From</span><span>Depart</span><span></span><span>Arrive</span><span>ETA</span><span>Spot</span><span>PAX</span></div><div class="bb" id="ab"></div></div>
 <div class="board"><div class="bh"><div class="bt de">🛫 Scheduled Departures</div><span class="bc" id="dnc">0</span></div><div class="cols cd"><span>Ident</span><span>Type</span><span>To</span><span>Depart</span><span>ETD</span><span>Cat</span><span>CIP</span><span>Fuel</span><span>Lav</span><span>H2O</span></div><div class="bb" id="db"></div></div>
 </div>
 <div class="boards done-boards">
@@ -483,6 +492,34 @@ body{font-family:var(--sans);background:var(--b0);color:var(--t1);min-height:100
 // === SKYWAY DASHBOARD ===
 var MODEL={C172:'Skyhawk',C182:'Skylane',C206:'Stationair',C208:'Caravan',C210:'Centurion',C25A:'CJ2',C25B:'CJ3',C25C:'CJ4',C500:'Citation I',C510:'Mustang',C525:'CJ1',C550:'Citation II',C560:'Citation V',C56X:'Excel',C680:'Sovereign',C68A:'Latitude',C700:'Longitude',C750:'Citation X',CL30:'Challenger 300',CL35:'Challenger 350',CL60:'Challenger 600',CRJ2:'CRJ-200',E35L:'Legacy 600',E545:'Legacy 450',E550:'Praetor 600',E55P:'Phenom 300',EA50:'Eclipse 500',F2TH:'Falcon 2000',F900:'Falcon 900',FA6X:'Falcon 6X',FA7X:'Falcon 7X',FA8X:'Falcon 8X',G150:'G150',G200:'G200',G280:'G280',GA4C:'G400',GA5C:'G500',GA6C:'G600',GA7C:'G700',GA8C:'G800',GALX:'Galaxy',GL5T:'Global 5500',GL7T:'Global 7500',GLEX:'G650',GLF2:'GII',GLF3:'GIII',GLF4:'GIV',GLF5:'GV/G550',GLF6:'G650/G650ER',GX6C:'Global 6500',H25B:'Hawker 800',HA4T:'HondaJet',HDJT:'HondaJet',LJ35:'Learjet 35',LJ45:'Learjet 45',LJ60:'Learjet 60',LJ75:'Learjet 75',PA28:'Cherokee',PA32:'Saratoga',PA46:'Malibu',PC12:'PC-12',PC24:'PC-24',PRM1:'Premier I',SF50:'Vision Jet',SR22:'SR22',SR20:'SR20',TBM7:'TBM 700',TBM8:'TBM 850',TBM9:'TBM 900',B350:'King Air 350',BE20:'King Air 200',BE36:'Bonanza',BE40:'Beechjet 400',BE58:'Baron',BE9L:'King Air C90',ASTR:'Astra',B06:'JetRanger',EC35:'EC135',EC45:'EC145',S76:'S-76',A139:'AW139'};
 var HELI={S76:1,EC35:1,EC45:1,B06:1,A139:1,AS50:1,AS55:1,EC30:1,EC55:1,H60:1,R22:1,R44:1,R66:1,BK17:1,B407:1,B412:1,B429:1,H500:1,MD52:1,MD60:1,AS65:1,S92:1,AW09:1,AW69:1,AW18:1,H135:1,H145:1,H160:1,H175:1,H215:1,H225:1,B505:1,B105:1,B212:1};
+var SPAN={GL7T:104,GL5T:94,GLEX:99,GLF6:99,GLF5:93,GLF4:78,GLF3:78,GLF2:69,GA7C:103,GA8C:103,GA6C:94,GA5C:87,GA4C:78,G280:63,G200:58,G150:55,GX6C:94,CL30:64,CL35:69,CL60:64,E35L:69,E545:66,E550:69,E55P:52,EA50:38,F2TH:70,F900:70,FA6X:86,FA7X:86,FA8X:86,C25A:47,C25B:47,C25C:50,C500:47,C510:43,C525:47,C550:52,C560:55,C56X:56,C680:64,C68A:72,C700:69,C750:64,H25B:54,HA4T:40,HDJT:40,LJ35:44,LJ45:48,LJ60:44,LJ75:51,PC12:53,PC24:56,B350:58,BE20:55,BE40:44,BE9L:54,SF50:39,SR22:38,SR20:37,PRM1:44,TBM7:42,TBM8:42,TBM9:42,PA46:43,PA32:37,PA28:35,C172:36,C182:36,C206:36,C208:52,C210:37,B06:33,EC35:33,EC45:36,S76:44,A139:46,ASTR:55};
+var SPOTS=[{name:'Spot 1',max:55},{name:'Spot 2',max:55},{name:'Spot 3',max:70},{name:'Spot 4',max:85},{name:'Spot 5',max:110},{name:'Btwn Hangars',max:120},{name:'2nd Line',max:70},{name:'Overflow',max:110},{name:'3rd Line',max:70},{name:'The Shop',max:110},{name:'Airfield Safety',max:110},{name:'The Island',max:110},{name:'The Fence',max:65},{name:'4th Line',max:150},{name:'42 West',max:110}];
+function suggestSpot(acType,stayHrs,isHeli){
+  var ws=SPAN[acType]||60;
+  if(isHeli)return {spot:'42 West',tow:''};
+  var spot='',tow='';
+  // Quick turn (< 2hrs) -> First Line
+  if(stayHrs<=2){
+    if(ws<=55)spot='Spot 1';else if(ws<=70)spot='Spot 3';else if(ws<=85)spot='Spot 4';else if(ws<=110)spot='Spot 5';else spot='Btwn Hangars';
+  }
+  // Medium stay (2-8hrs) -> Second/Third Line, stay put
+  else if(stayHrs<=8){
+    if(ws<=55)spot='2nd Line';else if(ws<=70)spot='2nd Line';else if(ws<=85)spot='Btwn Hangars';else if(ws<=110)spot='Overflow';else spot='4th Line';
+  }
+  // Long stay (8-24hrs) -> Third Line / Overflow
+  else if(stayHrs<=24){
+    if(ws<=55)spot='3rd Line';else if(ws<=70)spot='3rd Line';else if(ws<=85)spot='Overflow';else if(ws<=110)spot='Overflow';else spot='4th Line';
+  }
+  // Very long stay (24hrs+) -> push back, may need tow
+  else{
+    if(ws<=55)spot='3rd Line';
+    else if(ws<=70)spot='3rd Line';
+    else if(ws<=85)spot='Overflow';
+    else if(ws<=110){spot='Overflow';tow='Island if needed';}
+    else spot='4th Line';
+  }
+  return {spot:spot,tow:tow};
+}
 function getFlag(code){
   if(!code||code.length<2)return'';
   var p=code.substring(0,1).toUpperCase();
@@ -520,7 +557,7 @@ function isGA(cs,cat){
 
 var APT={KSFO:{lat:37.621,lon:-122.379,n:'San Francisco Intl'},KJFK:{lat:40.641,lon:-73.778,n:'JFK Intl'},KLAX:{lat:33.943,lon:-118.408,n:'Los Angeles Intl'},KORD:{lat:41.974,lon:-87.907,n:'Chicago OHare'},KDEN:{lat:39.856,lon:-104.674,n:'Denver Intl'},KSEA:{lat:47.450,lon:-122.309,n:'Seattle-Tacoma'}};
 var airport='KSFO',radius=200;
-var leafMap,markers={},allAC=[],gaAC=[],trackHistory={},trackLines={},faMapSet={};
+var leafMap,markers={},allAC=[],gaAC=[],trackHistory={},trackLines={},faMapSet={},identToMarkerId={};
 
 function buildFaMapSet(){
   faMapSet={};
@@ -558,6 +595,11 @@ window.onload=function(){
   setInterval(refresh,10000);
   setInterval(fetchBoards,30000);
   setInterval(buildFaMapSet,15000);
+  // Click delegation for tail number zoom-to-map
+  document.addEventListener('click',function(e){
+    var el=e.target.closest('.zp');
+    if(el&&el.dataset.zp){e.stopPropagation();zoomToPlane(el.dataset.zp);}
+  });
   // Live progress bar update every 5s
   setInterval(function(){
     var bars=document.querySelectorAll('.prog-fill');
@@ -599,7 +641,7 @@ function initMap(){
       if(d&&d.radar&&d.radar.past&&d.radar.past.length>0){
         var latest=d.radar.past[d.radar.past.length-1].path;
         if(window._radarLayer)leafMap.removeLayer(window._radarLayer);
-        window._radarLayer=L.tileLayer('https://tilecache.rainviewer.com'+latest+'/256/{z}/{x}/{y}/6/1_1.png',{opacity:0.4,maxZoom:18,zIndex:10}).addTo(leafMap);
+        window._radarLayer=L.tileLayer('https://tilecache.rainviewer.com'+latest+'/256/{z}/{x}/{y}/6/1_1.png',{opacity:0.2,maxZoom:18,zIndex:10}).addTo(leafMap);
       }
     }).catch(function(e){console.log('Radar fetch error:',e);});
   }
@@ -608,7 +650,7 @@ function initMap(){
   // Lightning overlay from Blitzortung
   window._lightningLayer=L.tileLayer('https://map.blitzortung.org/GETlightning.php?&north={n}&south={s}&east={e}&west={w}&z={z}&x={x}&y={y}',{opacity:0.7,maxZoom:18,zIndex:11,attribution:''});
   // Use simpler lightning tile approach
-  window._lightningLayer=L.tileLayer('https://tiles.blitzortung.org/strikes/1/{z}/{x}/{y}.png',{opacity:0.6,maxZoom:18,zIndex:11}).addTo(leafMap);
+  window._lightningLayer=L.tileLayer('https://tiles.blitzortung.org/strikes/1/{z}/{x}/{y}.png',{opacity:0.3,maxZoom:18,zIndex:11}).addTo(leafMap);
   // KSFO marker
   var sfoIcon=L.divIcon({className:'',html:'<div style="width:8px;height:8px;background:#1e3a5f;border:2px solid #fff;border-radius:50%;box-shadow:0 0 6px rgba(30,58,95,.4)"></div>',iconSize:[8,8],iconAnchor:[4,4]});
   L.marker([a.lat,a.lon],{icon:sfoIcon,interactive:false}).addTo(leafMap);
@@ -712,6 +754,27 @@ function drawMap(ac){
     popParts+='</div>';
     if(markers[a.id]){markers[a.id].setLatLng([a.lat,a.lon]);markers[a.id].setIcon(icon);markers[a.id].setPopupContent(popParts);}
     else{markers[a.id]=L.marker([a.lat,a.lon],{icon:icon}).addTo(leafMap).bindPopup(popParts);}
+    // Map callsign/ident to marker ID for click-to-zoom
+    var csUp=(a.cs||'').toUpperCase().replace(/ /g,'');
+    if(csUp)identToMarkerId[csUp]=a.id;
+    if(fi&&fi.ident)identToMarkerId[fi.ident.toUpperCase()]=a.id;
+    if(fi&&fi.callsign)identToMarkerId[fi.callsign.toUpperCase()]=a.id;
+  }
+}
+function zoomToPlane(ident){
+  if(!ident)return;
+  var key=ident.toUpperCase().replace(/[^A-Z0-9]/g,'');
+  var mid=identToMarkerId[key];
+  if(mid&&markers[mid]){
+    var ll=markers[mid].getLatLng();
+    leafMap.setView(ll,12,{animate:true});
+    markers[mid].openPopup();
+    // Flash effect
+    var el=markers[mid].getElement();
+    if(el){el.style.filter='brightness(2)';setTimeout(function(){el.style.filter='';},1500);}
+  } else {
+    // Scroll to map area
+    document.getElementById('map').scrollIntoView({behavior:'smooth'});
   }
 }
 function altCol(a,g){if(g||a<=0)return'#1e40af';if(a<5000)return'#16a34a';if(a<12000)return'#d97706';if(a<25000)return'#2563eb';return'#7c3aed';}
@@ -839,7 +902,15 @@ function mkRow(f,cls,done){
   }
   var enRoute=hasDep&&!done&&!f._landed;
   var gd=enRoute?'<span style="position:absolute;left:4px;top:8px;width:7px;height:7px;border-radius:50%;background:#22c55e;box-shadow:0 0 5px rgba(34,197,94,.5)"></span>':'';
-  return '<div class="fr'+rowCls+'"><span class="fi">'+gd+id+csSub+'</span><span class="ft" style="line-height:1.1">'+(typeCode||'—')+typeSub+'</span><span class="'+ffcls+'">'+flag+(loc||'—')+locSub+'</span><span class="fm">'+(f.depart||'—')+'</span>'+progBar+'<span class="fm">'+(f.arrive||'—')+'</span><span class="'+fecls+'">'+etaStr+'</span><input class="pax" type="number" min="0" max="99" placeholder="—" id="pax_'+paxId+'" onclick="event.stopPropagation()" /></div>';
+  var safeId=id.replace(/[^a-zA-Z0-9]/g,'');
+  // Calculate suggested parking spot
+  var isH=HELI[f.type]?true:false;
+  var stayHrs=24;
+  var sug=suggestSpot(f.type,stayHrs,isH);
+  var spotText=sug.spot;
+  if(sug.tow)spotText+='<br><span style="font-size:7px;color:var(--t3)">tow to '+sug.tow+'</span>';
+  var spotCell='<span class="fm" style="font-size:9px;font-weight:700;color:var(--cyan);line-height:1.2">'+spotText+'</span>';
+  return '<div class="fr'+rowCls+'"><span class="fi zp" data-zp="'+safeId+'">'+gd+id+csSub+'</span><span class="ft" style="line-height:1.1">'+(typeCode||'—')+typeSub+'</span><span class="'+ffcls+'">'+flag+(loc||'—')+locSub+'</span><span class="fm">'+(f.depart||'—')+'</span>'+progBar+'<span class="fm">'+(f.arrive||'—')+'</span><span class="'+fecls+'">'+etaStr+'</span>'+spotCell+'<input class="pax" type="number" min="0" max="99" placeholder="—" id="pax_'+paxId+'" onclick="event.stopPropagation()" /></div>';
 }
 
 function calcMins(isoTime){
@@ -861,7 +932,12 @@ function calcProgClient(depISO,arrISO){
 }
 
 function fetchBoards(){
-  fetch('/fa/arrivals').then(function(r){return r.json();}).then(function(arr){
+  console.log('[BOARDS] Fetching arrivals...');
+  fetch('/fa/arrivals').then(function(r){
+    console.log('[BOARDS] Arrivals response:',r.status);
+    return r.json();
+  }).then(function(arr){
+    console.log('[BOARDS] Arrivals count:',arr?arr.length:0);
     document.getElementById('ffa').className='fd on';
     var ab=document.getElementById('ab');
     var adb=document.getElementById('adb');
@@ -1019,8 +1095,9 @@ function showGround(){
   fetch('/fa/ground').then(function(r){return r.json();}).then(function(g){
     var tb=document.getElementById('gnd-table');
     if(!g||!g.length){tb.innerHTML='<p style="text-align:center;color:var(--t3);padding:30px;font-family:var(--mono)">No aircraft on ground</p>';return;}
+    var spotNames=['','Spot 1','Spot 2','Spot 3','Spot 4','Spot 5','Btwn Hangars','2nd Line','Overflow','3rd Line','The Shop','Airfield Safety','The Island','The Fence','4th Line','42 West'];
     var h='<table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px">';
-    h+='<tr style="background:var(--b0);font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--t3)"><th style="padding:8px 6px;text-align:left">Tail</th><th>Callsign</th><th>Type</th><th>From</th><th>On Ground</th><th>Next Dest</th><th>Dep <60m</th></tr>';
+    h+='<tr style="background:var(--b0);font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--t3)"><th style="padding:8px 6px;text-align:left">Tail</th><th>Type</th><th>From</th><th>On Ground</th><th>Next Dest</th><th>Departing</th><th style="min-width:90px">Parked At</th></tr>';
     for(var i=0;i<g.length;i++){
       var f=g[i];
       var fromStr=(f.from||'—')+(f.city?' <span style="color:var(--t3);font-size:9px">'+f.city+'</span>':'')+(f.country?' <span style="color:var(--red);font-size:9px">'+f.country+'</span>':'');
@@ -1032,11 +1109,33 @@ function showGround(){
       var destStr=(f.nextDest||'—')+(f.nextDestCity?' <span style="font-size:9px;color:var(--t3)">'+f.nextDestCity+'</span>':'');
       var bg=i%2===0?'var(--b1)':'var(--b2)';
       var depColor=f.nextDest?'var(--green)':'var(--t3)';
-      h+='<tr style="background:'+bg+'"><td style="padding:7px 6px;font-weight:700;color:var(--cyan)">'+f.ident+'</td><td style="text-align:center;color:var(--t2)">'+(f.callsign||'—')+'</td><td style="text-align:center">'+typeStr+'</td><td style="text-align:center">'+fromStr+'</td><td style="text-align:center;color:var(--amber)">'+sinceArr+'</td><td style="text-align:center">'+destStr+'</td><td style="text-align:center;color:'+depColor+'">'+untilDep+'</td></tr>';
+      var safeId=(f.ident||'').replace(/[^a-zA-Z0-9]/g,'');
+      // Suggested spot
+      var isH=HELI[f.type]?true:false;
+      var stayHrs=24;
+      if(f.nextDepartISO){var dMs=new Date(f.nextDepartISO).getTime();stayHrs=Math.max(0,(dMs-Date.now())/3600000);}
+      var sug=suggestSpot(f.type,stayHrs,isH);
+      var sugName=sug.spot+(sug.tow?' → '+sug.tow:'');
+      // Build dropdown
+      var saved=window._parkingAssignments&&window._parkingAssignments[safeId]?window._parkingAssignments[safeId]:'';
+      var sel='<select style="font-family:var(--mono);font-size:9px;font-weight:600;padding:2px 3px;border:1px solid var(--bd);border-radius:3px;background:var(--b1);color:var(--t1);cursor:pointer" onchange="assignParking(this.dataset.id,this.value)" data-id="'+safeId+'">';
+      for(var s=0;s<spotNames.length;s++){
+        var selected=(saved===spotNames[s]||(! saved&&spotNames[s]===sug.spot))?'selected':'';
+        var label=spotNames[s]||'—';
+        sel+='<option value="'+spotNames[s]+'" '+selected+'>'+label+'</option>';
+      }
+      sel+='</select>';
+      h+='<tr style="background:'+bg+'"><td style="padding:7px 6px;font-weight:700;color:var(--cyan)">'+f.ident+'</td><td style="text-align:center">'+typeStr+'</td><td style="text-align:center">'+fromStr+'</td><td style="text-align:center;color:var(--amber)">'+sinceArr+'</td><td style="text-align:center">'+destStr+'</td><td style="text-align:center;color:'+depColor+'">'+untilDep+'</td><td style="text-align:center">'+sel+'</td></tr>';
     }
     h+='</table>';
     tb.innerHTML=h;
   }).catch(function(e){document.getElementById('gnd-table').innerHTML='<p style="color:var(--red);padding:20px">Error loading data</p>';});
+}
+// Parking assignments stored in memory
+if(!window._parkingAssignments)window._parkingAssignments={};
+function assignParking(id,spot){
+  if(!id&&this&&this.dataset)id=this.dataset.id;
+  window._parkingAssignments[id]=spot;
 }
 function closeGround(){document.getElementById('gnd-overlay').style.display='none';}
 
