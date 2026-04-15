@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { WebSocketServer } = require('ws');
 
-const PORT = 8766, WS_PORT = 8765;
+const PORT = process.env.PORT || 8766, WS_PORT = 8765;
 const OSKY_ID = 'skyway-api-client';
 const OSKY_SECRET = 'TzrrCV2IoPlIqmRiRcpUIVscZQheFBQS';
 const TOKEN_URL = 'https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token';
@@ -77,13 +77,14 @@ async function fetchFlightAware(){
         var city=f.origin&&f.origin.city?f.origin.city:'';
         var tail=f.registration||'';
         var flightId=f.ident||'';
-        var blocked=!tail&&(flightId==='BLOCKED'||f.blocked);
+        var blocked=f.blocked||(!tail&&!flightId);
         var displayIdent=tail||flightId||'BLOCKED';
         var displayCallsign='';
-        if(blocked){displayIdent='BLOCKED';displayCallsign=f.aircraft_type?'':'';}
-        else if(tail&&flightId&&flightId!==tail)displayCallsign=flightId;
-        return{ident:displayIdent,callsign:displayCallsign,blocked:blocked,type:f.aircraft_type||(blocked?'BLOCKED':''),from:orig||(blocked?'BLOCKED':''),intl:intl,city:intl?'':city,country:intl?city:'',
-        depart:fmtTime(depISO)||(blocked?'—':''),departISO:depISO,arrive:fmtTime(arrISO)||(blocked?'—':''),arriveISO:arrISO,
+        if(blocked&&!tail&&!flightId)displayIdent='BLOCKED';
+        else if(blocked&&flightId)displayIdent=flightId;
+        if(tail&&flightId&&flightId!==tail)displayCallsign=flightId;
+        return{ident:displayIdent,callsign:displayCallsign,blocked:blocked,type:f.aircraft_type||'',from:orig||'',intl:intl,city:intl?'':city,country:intl?city:'',
+        depart:fmtTime(depISO)||'',departISO:depISO,arrive:fmtTime(arrISO)||'',arriveISO:arrISO,
         progress:typeof f.progress_percent==='number'?f.progress_percent:(f.actual_on?100:(f.actual_off?50:0)),
         arrived:!!f.actual_on,status:f.status||'',operator:getOperator(flightId)};
       });
@@ -96,10 +97,10 @@ async function fetchFlightAware(){
         var intl=orig&&orig.length>=2&&orig.charAt(0)!=='K'&&orig.charAt(0)!=='P';
         var city=f.origin&&f.origin.city?f.origin.city:'';
         var tail=f.registration||'';var flightId=f.ident||'';
-        var blocked=!tail&&(flightId==='BLOCKED'||f.blocked);
-        var displayIdent=blocked?'BLOCKED':(tail||flightId||'BLOCKED');
+        var blocked=f.blocked||(!tail&&!flightId);
+        var displayIdent=tail||flightId||'BLOCKED';
         var displayCallsign=(!blocked&&tail&&flightId&&flightId!==tail)?flightId:'';
-        return{ident:displayIdent,callsign:displayCallsign,blocked:blocked,type:f.aircraft_type||(blocked?'BLOCKED':''),from:orig||(blocked?'BLOCKED':''),intl:intl,city:intl?'':city,country:intl?city:'',
+        return{ident:displayIdent,callsign:displayCallsign,blocked:blocked,type:f.aircraft_type||'',from:orig||'',intl:intl,city:intl?'':city,country:intl?city:'',
         depart:fmtTime(depISO),departISO:depISO,arrive:fmtTime(arrISO),arriveISO:arrISO,
         progress:typeof f.progress_percent==='number'?f.progress_percent:(f.actual_on?100:(f.actual_off?50:0)),
         arrived:false,status:f.status||'',operator:getOperator(flightId)};
@@ -116,10 +117,10 @@ async function fetchFlightAware(){
         var intl=dest&&dest.length>=2&&dest.charAt(0)!=='K'&&dest.charAt(0)!=='P';
         var city=f.destination&&f.destination.city?f.destination.city:'';
         var tail=f.registration||'';var flightId=f.ident||'';
-        var blocked=!tail&&(flightId==='BLOCKED'||f.blocked);
-        var displayIdent=blocked?'BLOCKED':(tail||flightId||'BLOCKED');
+        var blocked=f.blocked||(!tail&&!flightId);
+        var displayIdent=tail||flightId||'BLOCKED';
         var displayCallsign=(!blocked&&tail&&flightId&&flightId!==tail)?flightId:'';
-        return{ident:displayIdent,callsign:displayCallsign,blocked:blocked,type:f.aircraft_type||(blocked?'BLOCKED':''),to:dest||(blocked?'BLOCKED':''),intl:intl,city:intl?'':city,country:intl?city:'',
+        return{ident:displayIdent,callsign:displayCallsign,blocked:blocked,type:f.aircraft_type||'',to:dest||'',intl:intl,city:intl?'':city,country:intl?city:'',
         depart:fmtTime(depISO),departISO:depISO,arrive:fmtTime(arrISO),arriveISO:arrISO,
         progress:typeof f.progress_percent==='number'?f.progress_percent:(f.actual_on?100:(f.actual_off?50:0)),
         departed:!!f.actual_off,arrived:!!f.actual_on,status:f.status||'',operator:getOperator(flightId)};
@@ -133,10 +134,10 @@ async function fetchFlightAware(){
         var intl=dest&&dest.length>=2&&dest.charAt(0)!=='K'&&dest.charAt(0)!=='P';
         var city=f.destination&&f.destination.city?f.destination.city:'';
         var tail=f.registration||'';var flightId=f.ident||'';
-        var blocked=!tail&&(flightId==='BLOCKED'||f.blocked);
-        var displayIdent=blocked?'BLOCKED':(tail||flightId||'BLOCKED');
+        var blocked=f.blocked||(!tail&&!flightId);
+        var displayIdent=tail||flightId||'BLOCKED';
         var displayCallsign=(!blocked&&tail&&flightId&&flightId!==tail)?flightId:'';
-        return{ident:displayIdent,callsign:displayCallsign,blocked:blocked,type:f.aircraft_type||(blocked?'BLOCKED':''),to:dest||(blocked?'BLOCKED':''),intl:intl,city:intl?'':city,country:intl?city:'',
+        return{ident:displayIdent,callsign:displayCallsign,blocked:blocked,type:f.aircraft_type||'',to:dest||'',intl:intl,city:intl?'':city,country:intl?city:'',
         depart:fmtTime(depISO),departISO:depISO,arrive:fmtTime(arrISO),arriveISO:arrISO,
         progress:typeof f.progress_percent==='number'?f.progress_percent:(f.actual_on?100:(f.actual_off?50:0)),
         departed:false,arrived:false,status:f.status||'',operator:getOperator(flightId)};
