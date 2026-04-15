@@ -256,7 +256,7 @@ const server = http.createServer(async(req,res)=>{
   res.writeHead(200,{'Content-Type':'application/json'});
   res.end(JSON.stringify({name:'Skyway',url:'http://localhost:'+PORT}));
 });
-server.listen(PORT,()=>log('http://localhost:'+PORT,'OK'));
+server.listen(PORT,'0.0.0.0',()=>log('http://0.0.0.0:'+PORT,'OK'));
 
 const wss=new WebSocketServer({port:WS_PORT});
 wss.on('connection',ws=>{wsClients.add(ws);log('WS connected ('+wsClients.size+')');ws.send(JSON.stringify({type:'init',swimArr:swimArr.slice(0,50),swimDep:swimDep.slice(0,50),swimStats:swimStats}));ws.on('close',()=>wsClients.delete(ws));});
