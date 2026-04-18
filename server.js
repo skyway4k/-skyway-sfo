@@ -423,7 +423,7 @@ body{font-family:var(--sans);background:var(--b0);color:var(--t1);min-height:100
 .bb{flex:1;padding:5px 8px}
 .fr{display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr .7fr .7fr .5fr;gap:6px;align-items:center;padding:7px 8px;background:var(--b1);border:1px solid var(--bd);border-radius:7px;margin-bottom:3px;cursor:pointer;transition:all .12s;box-shadow:0 1px 2px rgba(0,0,0,.02)}
 .fr.arr-done{grid-template-columns:1fr 1fr 1fr 1fr 1fr .8fr .7fr}
-.fr.dep{grid-template-columns:1fr 1fr 1fr 1fr .8fr .5fr .5fr .5fr .5fr .5fr}
+.fr.dep{grid-template-columns:1fr 1fr 1fr 1fr .7fr .7fr .4fr .4fr .4fr .4fr .4fr}
 .fr.dep-simple{grid-template-columns:1fr 1fr 1fr 1fr .8fr .7fr}
 .fr:hover{background:var(--b2);border-color:var(--bd)}
 .fr.done{opacity:1}
@@ -1500,10 +1500,20 @@ function showRampView(){
       bayPoly(s.lat,s.lng,depth,noseW,wingW,col,fm,bm,name);
       }
       var shortName=name.replace('Airfield Safety','AFS').replace('Ken Salvage','KenS').replace('Btwn Hangars 1','Btwn Hangars 2','Btwn Hangars 3','Btwn Hangars 4','Btwn Hngrs');
-      var lbl=L.marker([s.lat,s.lng],{interactive:false,icon:L.divIcon({className:'',html:'<div id="rl_'+name.replace(/[^a-zA-Z0-9]/g,'')+'" style="font-family:monospace;font-size:8px;font-weight:800;color:#22c55e;background:rgba(0,0,0,.75);padding:1px 5px;border-radius:3px;white-space:nowrap;text-align:center">'+shortName+'</div>',iconSize:[80,14],iconAnchor:[40,7]})}).addTo(rampMap);
+      var lbl=L.marker([s.lat,s.lng],{interactive:true,icon:L.divIcon({className:'',html:'<div id="rl_'+name.replace(/[^a-zA-Z0-9]/g,'')+'" style="font-family:monospace;font-size:8px;font-weight:800;color:#22c55e;background:rgba(0,0,0,.75);padding:1px 5px;border-radius:3px;white-space:nowrap;text-align:center">'+shortName+'</div>',iconSize:[80,14],iconAnchor:[40,7]})}).addTo(rampMap);
       rampSpotLabels.push(lbl);
       if(!window._rampLabelMarkers)window._rampLabelMarkers={};
       window._rampLabelMarkers[name]=lbl;
+      (function(spotName,marker){
+        marker.on('click',function(){
+          if(window._manualOccupied[spotName]){
+            delete window._manualOccupied[spotName];
+          } else {
+            window._manualOccupied[spotName]='MANUAL';
+          }
+          updateRampColors();
+        });
+      })(name,lbl);
       rampLabels[name]=name.replace(/[^a-zA-Z0-9]/g,'');
     }
     // Custom polygons for specific spots
@@ -1715,6 +1725,29 @@ function loadRampPlanes(){
       }
     }
   }).catch(function(e){console.error('Ramp load error:',e);});
+}
+function updateRampColors(){
+  var occupied=window._lastOccupied||{};
+  // Merge manual occupied
+  if(window._manualOccupied){
+    for(var mk in window._manualOccupied)occupied[mk]=true;
+  }
+  for(var pn in rampPolygons){
+    if(occupied[pn]){
+      rampPolygons[pn].setStyle({color:'#ef4444',fillColor:'#ef4444',fillOpacity:0.15});
+    } else {
+      rampPolygons[pn].setStyle({color:'#22c55e',fillColor:'#22c55e',fillOpacity:0.1});
+    }
+  }
+  if(window._rampLabelMarkers){
+    for(var ln in window._rampLabelMarkers){
+      var lm=window._rampLabelMarkers[ln];
+      var occ=occupied[ln];
+      var lCol=occ?'#ef4444':'#22c55e';
+      var shortN=ln.replace('Airfield Safety','AFS').replace('Ken Salvage','KenS').replace('Btwn Hangars','BH');
+      lm.setIcon(L.divIcon({className:'',html:'<div style="font-family:monospace;font-size:8px;font-weight:800;color:#fff;background:'+lCol+';padding:1px 5px;border-radius:3px;white-space:nowrap;text-align:center;opacity:0.9;cursor:pointer">'+shortN+'</div>',iconSize:[60,12],iconAnchor:[30,6]}));
+    }
+  }
 }
 function closeRamp(){document.getElementById('ramp-overlay').style.display='none';}
 
