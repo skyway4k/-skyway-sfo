@@ -214,12 +214,10 @@ const server = http.createServer(async(req,res)=>{
   }
   if(req.url.startsWith('/osky/')){await proxyOsky(req.url.replace('/osky',''),res);return;}
   if(req.url==='/fa/arrivals'){
-    log('Serving '+faArrivals.length+' arrivals','MSG');
     res.writeHead(200,{'Content-Type':'application/json'});
     res.end(JSON.stringify(faArrivals));return;
   }
   if(req.url==='/fa/departures'){
-    log('Serving '+faDepartures.length+' departures','MSG');
     res.writeHead(200,{'Content-Type':'application/json'});
     res.end(JSON.stringify(faDepartures));return;
   }
@@ -417,16 +415,16 @@ body{font-family:var(--sans);background:var(--b0);color:var(--t1);min-height:100
 .bt.ar{color:var(--blue)}.bt.de{color:var(--red)}
 .bc{font-family:var(--mono);font-size:11px;font-weight:700;color:var(--t3)}
 .cols{display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr .7fr .7fr .5fr;gap:6px;padding:7px 12px;font-family:var(--mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--t3);border-bottom:1px solid var(--bd);text-align:center;background:var(--b2)}
-.cols.ca-done{display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr .8fr;gap:6px;padding:7px 12px;font-family:var(--mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--t3);border-bottom:1px solid var(--bd);text-align:center;background:var(--b2)}
-.cols.cd-done{display:grid;grid-template-columns:1fr 1fr 1fr 1fr .8fr;gap:6px;padding:7px 12px;font-family:var(--mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--t3);border-bottom:1px solid var(--bd);text-align:center;background:var(--b2)}
+.cols.ca-done{display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr .8fr .7fr;gap:6px;padding:7px 12px;font-family:var(--mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--t3);border-bottom:1px solid var(--bd);text-align:center;background:var(--b2)}
+.cols.cd-done{display:grid;grid-template-columns:1fr 1fr 1fr 1fr .8fr .7fr;gap:6px;padding:7px 12px;font-family:var(--mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--t3);border-bottom:1px solid var(--bd);text-align:center;background:var(--b2)}
 .cols.ca{grid-template-columns:1fr 1fr 1fr 1fr 1fr .7fr .7fr .5fr}
-.cols.cd{grid-template-columns:1fr 1fr 1fr 1fr .8fr .5fr .5fr .5fr .5fr .5fr}
+.cols.cd{grid-template-columns:1fr 1fr 1fr 1fr .7fr .7fr .4fr .4fr .4fr .4fr .4fr}
 .cols span:first-child{text-align:left;padding-left:16px}
 .bb{flex:1;padding:5px 8px}
 .fr{display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr .7fr .7fr .5fr;gap:6px;align-items:center;padding:7px 8px;background:var(--b1);border:1px solid var(--bd);border-radius:7px;margin-bottom:3px;cursor:pointer;transition:all .12s;box-shadow:0 1px 2px rgba(0,0,0,.02)}
-.fr.arr-done{grid-template-columns:1fr 1fr 1fr 1fr 1fr .8fr}
+.fr.arr-done{grid-template-columns:1fr 1fr 1fr 1fr 1fr .8fr .7fr}
 .fr.dep{grid-template-columns:1fr 1fr 1fr 1fr .8fr .5fr .5fr .5fr .5fr .5fr}
-.fr.dep-simple{grid-template-columns:1fr 1fr 1fr 1fr .8fr}
+.fr.dep-simple{grid-template-columns:1fr 1fr 1fr 1fr .8fr .7fr}
 .fr:hover{background:var(--b2);border-color:var(--bd)}
 .fr.done{opacity:1}
 .fr.arr-active{background:rgba(37,99,235,.03);border-color:rgba(37,99,235,.12)}
@@ -435,7 +433,12 @@ body{font-family:var(--sans);background:var(--b0);color:var(--t1);min-height:100
 .fr.dep-gone{background:rgba(220,38,38,.04);border-color:rgba(220,38,38,.12)}
 .chk{width:16px;height:16px;accent-color:var(--green);cursor:pointer;margin:0 auto;display:block}
 .fi{font-family:var(--mono);font-weight:800;font-size:17px;color:var(--cyan);overflow:visible;text-overflow:ellipsis;white-space:nowrap;line-height:1.2;position:relative;padding-left:16px}
-.fi.zp{cursor:pointer}.fi.zp:hover{color:var(--blue);text-decoration:underline}
+.fi
+#map .leaflet-tile-pane{filter:invert(1) hue-rotate(180deg) brightness(0.6) contrast(1.2) saturate(0.3)}
+.spot-dd{position:absolute;z-index:100;background:var(--b1);border:1px solid var(--bd);border-radius:4px;box-shadow:0 4px 12px rgba(0,0,0,.2);padding:4px 0;max-height:200px;overflow-y:auto}
+.spot-dd-item{font-family:var(--mono);font-size:9px;padding:3px 10px;cursor:pointer;color:var(--t1);white-space:nowrap}
+.spot-dd-item:hover{background:var(--blue);color:#fff}
+.zp{cursor:pointer}.fi.zp:hover{color:var(--blue);text-decoration:underline}
 .fi .sub{font-size:9px;font-weight:500;color:var(--t3);display:block}
 .ft{font-family:var(--mono);font-size:16px;font-weight:700;color:var(--t1);text-align:center;line-height:1.2}
 .ft .sub{font-size:8px;font-weight:500;color:var(--t3);display:block}
@@ -463,10 +466,26 @@ body{font-family:var(--sans);background:var(--b0);color:var(--t1);min-height:100
 ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-thumb{background:#d1d5db;border-radius:3px}::-webkit-scrollbar-thumb:hover{background:#9ca3af}
 .bb .fr:nth-child(even){background:rgba(0,0,0,.02)}
 .bb .fr:nth-child(odd){background:var(--b1)}
+
+#map .leaflet-tile-pane{filter:invert(1) hue-rotate(180deg) brightness(0.6) contrast(1.2) saturate(0.3)}
+.spot-dd{position:absolute;z-index:100;background:var(--b1);border:1px solid var(--bd);border-radius:4px;box-shadow:0 4px 12px rgba(0,0,0,.2);padding:4px 0;max-height:200px;overflow-y:auto}
+.spot-dd-item{font-family:var(--mono);font-size:9px;padding:3px 10px;cursor:pointer;color:var(--t1);white-space:nowrap}
+.spot-dd-item:hover{background:var(--blue);color:#fff}
 .zp{cursor:pointer;transition:color .15s}.zp:hover{color:var(--blue)!important;text-decoration:underline}
 .leaflet-popup-content-wrapper{background:rgba(15,23,42,.85)!important;color:#e2e8f0!important;border-radius:6px!important;box-shadow:0 2px 8px rgba(0,0,0,.4)!important;font-size:9px!important;padding:0!important}
 .leaflet-popup-content{margin:6px 8px!important;color:#e2e8f0!important}
 .leaflet-popup-tip{background:rgba(15,23,42,.85)!important}
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+#cesium-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;z-index:9997;background:#050a15}
+#cesiumContainer{width:100%;height:100%;overflow:hidden}
+#cesium-hud{position:absolute;top:12px;left:12px;z-index:10;font-family:var(--mono)}
+#cesium-close{position:absolute;top:12px;right:12px;z-index:10;background:rgba(0,0,0,.6);color:#fff;border:1px solid rgba(255,255,255,.2);border-radius:6px;padding:6px 14px;font-family:var(--mono);font-size:12px;cursor:pointer;font-weight:700}
+#cesium-close:hover{background:rgba(255,255,255,.15)}
+#cesium-title{background:rgba(0,0,0,.6);color:#fff;padding:6px 12px;border-radius:6px;font-size:11px;font-weight:700;border:1px solid rgba(255,255,255,.1)}
+#plane-labels{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:50;overflow:hidden}
+.plane-label{pointer-events:auto;position:absolute;font-family:monospace;font-size:9px;font-weight:700;color:#fff;background:rgba(0,0,0,.6);padding:1px 5px;border-radius:3px;white-space:nowrap;cursor:pointer;transform:translate(-50%,-100%);transition:background .15s}.plane-label:hover{background:rgba(59,130,246,.6)}
 </style>
 </head>
 <body>
@@ -490,6 +509,11 @@ body{font-family:var(--sans);background:var(--b0);color:var(--t1);min-height:100
 <div id="gnd-table" style="padding:10px 16px;overflow-y:auto;max-height:calc(85vh - 60px)"></div>
 </div>
 </div>
+<div id="cesium-overlay">
+<div id="cesiumContainer"></div>
+<div id="cesium-hud"><span id="cesium-title">SKYWAY 3D — KSFO Airspace</span></div>
+<button id="cesium-close" onclick="close3D()">✕ Close</button>
+</div>
 <div id="ramp-overlay" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.5);z-index:9998" onclick="if(event.target===this)closeRamp()">
 <div style="position:absolute;top:2%;left:2%;right:2%;bottom:2%;background:var(--b1);border:1px solid var(--bd);border-radius:12px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.3);display:flex;flex-direction:column">
 <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-bottom:1px solid var(--bd);background:var(--b0);flex-shrink:0">
@@ -505,11 +529,11 @@ body{font-family:var(--sans);background:var(--b0);color:var(--t1);min-height:100
 <div class="resize-bar" id="resizeBar"><div class="resize-grip"></div></div>
 <div class="boards">
 <div class="board"><div class="bh"><div class="bt ar">🛬 En Route / Scheduled to SFO</div><span class="bc" id="anc">0</span></div><div class="cols ca"><span>Ident</span><span>Type</span><span>From</span><span>Depart</span><span>Arrive</span><span>ETA</span><span>Spot</span><span>PAX</span></div><div class="bb" id="ab"></div></div>
-<div class="board"><div class="bh"><div class="bt de">🛫 Scheduled Departures</div><span class="bc" id="dnc">0</span></div><div class="cols cd"><span>Ident</span><span>Type</span><span>To</span><span>Depart</span><span>ETD</span><span>Cat</span><span>CIP</span><span>Fuel</span><span>Lav</span><span>H2O</span></div><div class="bb" id="db"></div></div>
+<div class="board"><div class="bh"><div class="bt de">🛫 Scheduled Departures</div><span class="bc" id="dnc">0</span></div><div class="cols cd"><span>Ident</span><span>Type</span><span>To</span><span>Depart</span><span>ETD</span><span>Spot</span><span>Cat</span><span>CIP</span><span>Fuel</span><span>Lav</span><span>H2O</span></div><div class="bb" id="db"></div></div>
 </div>
 <div class="boards done-boards">
-<div class="board"><div class="bh done-hdr" id="ah" style="display:none"><div class="bt ar" style="opacity:.5">✓ Arrived</div><span class="bc" id="adc">0</span></div><div class="cols ca-done" id="ahcols" style="display:none"><span>Ident</span><span>Type</span><span>From</span><span>Depart</span><span>Arrive</span><span>Time</span></div><div class="bb" id="adb" style="display:none"></div></div>
-<div class="board"><div class="bh done-hdr" id="dh" style="display:none"><div class="bt de" style="opacity:.5">✓ Departed</div><span class="bc" id="ddc">0</span></div><div class="cols cd-done" id="dhcols" style="display:none"><span>Ident</span><span>Type</span><span>To</span><span>Depart</span><span>Time</span></div><div class="bb" id="ddb" style="display:none"></div></div>
+<div class="board"><div class="bh done-hdr" id="ah" style="display:none"><div class="bt ar" style="opacity:.5">✓ Arrived</div><span class="bc" id="adc">0</span></div><div class="cols ca-done" id="ahcols" style="display:none"><span>Ident</span><span>Type</span><span>From</span><span>Depart</span><span>Arrive</span><span>Time</span><span>Spot</span></div><div class="bb" id="adb" style="display:none"></div></div>
+<div class="board"><div class="bh done-hdr" id="dh" style="display:none"><div class="bt de" style="opacity:.5">✓ Departed</div><span class="bc" id="ddc">0</span></div><div class="cols cd-done" id="dhcols" style="display:none"><span>Ident</span><span>Type</span><span>To</span><span>Depart</span><span>Time</span><span>Spot</span></div><div class="bb" id="ddb" style="display:none"></div></div>
 </div>
 </body>
 <` + `script>
@@ -535,58 +559,78 @@ var SPOT_DEFS=[
   {name:'Spot 5',cats:[3,4,5],pri:2,qt:true},
   {name:'Ken Salvage',cats:[2,3],pri:3,qt:false},
   {name:'2nd Line',cats:[1,2,3],pri:4,qt:false},
-  {name:'Btwn Hangars',cats:[1,2,3,4,5],pri:4,qt:false},
+  {name:'Btwn Hangars 1',cats:[4,5],pri:6},
+  {name:'Btwn Hangars 2',cats:[4,5],pri:6},
+  {name:'Btwn Hangars 3',cats:[4,5],pri:6},
+  {name:'Btwn Hangars 4',cats:[4,5],pri:6},
   {name:'Overflow',cats:[4,5,6],pri:5,qt:false},
   {name:'3rd Line',cats:[1,2,3,4],pri:5,qt:false},
   {name:'The Shop',cats:[4,5],pri:6,qt:false},
   {name:'Airfield Safety',cats:[4,5,6],pri:6,qt:false},
   {name:'The Island',cats:[4,5],pri:7,qt:false,note:'tow only'},
   {name:'The Fence',cats:[1,2],pri:7,qt:false,note:'tow only'},
-  {name:'42 West',cats:[4,5,6],pri:8,qt:false},
+  {name:'42 West 1',cats:[4,5],pri:8},
+  {name:'42 West 2',cats:[4,5],pri:8},
+  {name:'42 West 3',cats:[4,5],pri:8},
+  {name:'42 West 4',cats:[4,5],pri:8},
   {name:'4th Line',cats:[4,5,6],pri:9,qt:false,note:'call United/Airfield Safety to reserve'}
 ];
+// Global spot tracker - shared across all views
+if(!window._globalSpotMap)window._globalSpotMap={};
+function getNextAvailable(preferred,cat){
+  // If preferred is free, use it
+  if(!window._globalSpotMap[preferred])return preferred;
+  // Find next spot of same line/type that fits this cat
+  for(var i=0;i<SPOT_DEFS.length;i++){
+    var sd=SPOT_DEFS[i];
+    if(sd.cats.indexOf(cat)>=0&&!window._globalSpotMap[sd.name])return sd.name;
+  }
+  return preferred; // fallback
+}
 function suggestSpot(acType,stayHrs,isHeli,tailNum){
-  if(isHeli)return {spot:'42 West',tow:'',note:''};
-  // Check hangar tenants
+  if(isHeli)return {spot:getNextAvailable('42 West 1',5),tow:''};
   var tail=(tailNum||'').toUpperCase();
-  if(HANGAR_B.indexOf(tail)>=0)return {spot:'Hangar B',tow:'',note:'tenant'};
-  if(HANGAR_C.indexOf(tail)>=0)return {spot:'Hangar C',tow:'',note:'tenant'};
+  if(tail==='N650SB'||tail==='N950X')return {spot:'Hangar B',tow:''};
+  if(tail==='N800DL'||tail==='N808XX')return {spot:'Hangar C',tow:''};
   var cat=getWsCat(acType);
-  var spot='',tow='',note='';
-  // Quick turn (< 2hrs) -> First Line priority
+  var safeT=(tailNum||'').replace(/[^a-zA-Z0-9]/g,'');
+  // Check manual assignment first
+  if(window._parkingAssignments&&window._parkingAssignments[safeT]){
+    var ms=window._parkingAssignments[safeT];
+    window._globalSpotMap[ms]=safeT;
+    return {spot:ms,tow:''};
+  }
+  var spot='',tow='';
+  // Quick turn (< 2hrs)
   if(stayHrs<=2){
-    for(var i=0;i<SPOT_DEFS.length;i++){
-      var s=SPOT_DEFS[i];
-      if(s.qt&&s.cats.indexOf(cat)>=0){spot=s.name;break;}
-    }
-    if(!spot)spot=cat>=4?'Overflow':'2nd Line';
+    if(cat<=1)spot=getNextAvailable('Spot A',cat);
+    else if(cat<=2)spot=getNextAvailable('Spot 1',cat);
+    else if(cat<=3)spot=getNextAvailable('Spot 3',cat);
+    else if(cat<=5)spot=getNextAvailable('Spot 4',cat);
+    else spot=getNextAvailable('41-7 A',cat);
   }
-  // Medium stay (2-8hrs) -> Second/Third line
+  // Medium stay (2-8hrs)
   else if(stayHrs<=8){
-    if(cat<=2)spot='2nd Line';
-    else if(cat===3)spot='2nd Line';
-    else if(cat<=5)spot='Overflow';
-    else spot='Airfield Safety';
+    if(cat<=3)spot=getNextAvailable('2nd Line 1',cat);
+    else if(cat<=5)spot=getNextAvailable('Btwn Hangars 1',cat);
+    else spot=getNextAvailable('41-7 A',cat);
   }
-  // Long stay (8-24hrs) -> push back
+  // Long stay (8-24hrs)
   else if(stayHrs<=24){
-    if(cat<=2)spot='3rd Line';
-    else if(cat===3)spot='3rd Line';
-    else if(cat<=5){spot='Overflow';tow='The Island if needed';}
-    else spot='42 West';
+    if(cat<=3)spot=getNextAvailable('3rd Line 1',cat);
+    else if(cat<=5)spot=getNextAvailable('4th Line 1',cat);
+    else spot=getNextAvailable('41-7 A',cat);
   }
-  // Very long stay (24hrs+) -> farthest from FBO
+  // Very long stay (24hrs+)
   else{
-    if(cat<=2){spot='3rd Line';tow='The Fence if needed';}
-    else if(cat===3)spot='3rd Line';
-    else if(cat<=5){spot='42 West';tow='The Island if needed';}
-    else spot='42 West';
+    if(cat<=2){spot=getNextAvailable('3rd Line 1',cat);tow='Fence if needed';}
+    else if(cat<=3)spot=getNextAvailable('3rd Line 1',cat);
+    else if(cat<=5){spot=getNextAvailable('42 West 1',cat);tow='Island if full';}
+    else spot=getNextAvailable('41-7 A',cat);
   }
-  // Cat 5+ quick turns still need first line if possible
-  if(stayHrs<=2&&cat>=4&&(spot==='Overflow'||spot==='2nd Line')){
-    spot='Spot 5';
-  }
-  return {spot:spot,tow:tow,note:note};
+  // Mark spot as taken
+  window._globalSpotMap[spot]=safeT;
+  return {spot:spot,tow:tow};
 }
 function getFlag(code){
   if(!code||code.length<2)return'';
@@ -663,6 +707,37 @@ window.onload=function(){
   setInterval(refresh,10000);
   setInterval(fetchBoards,30000);
   setInterval(buildFaMapSet,15000);
+  // Spot click - inline dropdown
+  document.addEventListener('click',function(e){
+    var el=e.target.closest('.spot-click');
+    // Close any existing dropdown first
+    var old=document.querySelector('.spot-dd');if(old)old.remove();
+    if(!el)return;
+    e.stopPropagation();
+    var planeId=el.dataset.plane;
+    var rect=el.getBoundingClientRect();
+    var dd=document.createElement('div');dd.className='spot-dd';
+    dd.style.left=rect.left+'px';dd.style.top=rect.bottom+'px';
+    var spotNames=['Spot A','Spot 1','Spot 2','Spot 3','Spot 4','Spot 5','Ken Salvage','2nd Line 1','2nd Line 2','2nd Line 3','2nd Line 4','Overflow 1','Overflow 2','Btwn Hangars 1','Btwn Hangars 2','Btwn Hangars 3','Btwn Hangars 4','3rd Line 1','3rd Line 2','3rd Line 3','3rd Line 4','3rd Line 5','3rd Line 6','3rd Line 7','3rd Line 8','The Shop','Airfield Safety 1','Airfield Safety 2','4th Line 1','4th Line 2','4th Line 3','4th Line 4','41-7 A','41-7 B','41-11','42 West 1','42 West 2','42 West 3','42 West 4','The Island','The Fence','Hangar A','Hangar B','Hangar C'];
+    for(var i=0;i<spotNames.length;i++){
+      var item=document.createElement('div');item.className='spot-dd-item';
+      item.textContent=spotNames[i];item.dataset.spot=spotNames[i];
+      item.addEventListener('click',function(ev){
+        ev.stopPropagation();
+        var newSpot=ev.target.dataset.spot;
+        if(!window._parkingAssignments)window._parkingAssignments={};
+        window._parkingAssignments[planeId]=newSpot;
+        el.innerHTML=newSpot;
+        dd.remove();
+      });
+      dd.appendChild(item);
+    }
+    document.body.appendChild(dd);
+    // Close on outside click
+    setTimeout(function(){
+      document.addEventListener('click',function closeDD(){dd.remove();document.removeEventListener('click',closeDD);},{once:true});
+    },10);
+  });
   // Hover delegation for tail number zoom-to-map
   var hoverTimer=null;
   document.addEventListener('mouseover',function(e){
@@ -699,8 +774,8 @@ function initMap(){
   
   // Base map: CartoDB Voyager - blue ocean, terrain hints, city labels
   window._tileLayer=L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18}).addTo(leafMap);
-  window._darkTileUrl='https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png';
-  window._lightTileUrl='https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png';
+  window._darkTileUrl='https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+  window._lightTileUrl='https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
   // Weather radar overlay from RainViewer (free, no API key)
   window._radarLayer=null;
   function loadRadar(){
@@ -715,6 +790,11 @@ function initMap(){
     }).catch(function(e){console.log('Radar fetch error:',e);});
   }
   loadRadar();
+  // 3D view button
+  var btn3d=L.DomUtil.create('div');
+  btn3d.innerHTML='<button onclick="show3D()" style="font-family:var(--mono);font-size:10px;font-weight:700;color:#fff;background:rgba(59,130,246,.8);border:1px solid rgba(59,130,246,.4);border-radius:6px;padding:5px 10px;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3)">🌐 3D View</button>';
+  btn3d.style.cssText='position:absolute;bottom:12px;left:12px;z-index:1000';
+  document.getElementById('map').appendChild(btn3d);
   setInterval(loadRadar,300000); // refresh radar every 5 min
   // Lightning overlay from Blitzortung
   window._lightningLayer=L.tileLayer('https://map.blitzortung.org/GETlightning.php?&north={n}&south={s}&east={e}&west={w}&z={z}&x={x}&y={y}',{opacity:0.7,maxZoom:18,zIndex:11,attribution:''});
@@ -723,14 +803,14 @@ function initMap(){
   // KSFO marker
   var sfoIcon=L.divIcon({className:'',html:'<div style="width:8px;height:8px;background:#1e3a5f;border:2px solid #fff;border-radius:50%;box-shadow:0 0 6px rgba(30,58,95,.4)"></div>',iconSize:[8,8],iconAnchor:[4,4]});
   L.marker([a.lat,a.lon],{icon:sfoIcon,interactive:false}).addTo(leafMap);
-  // Range rings with labels
-  var rings=[5,10,15,25,50];
-  var ringStyle={color:'#64748b',fillColor:'transparent',fillOpacity:0,weight:.7,opacity:.25,dashArray:'8,6'};
+  // Range rings - clean, minimal
+  var rings=[5,20,50];
+  var ringColors=['rgba(100,116,139,.2)','rgba(100,116,139,.15)','rgba(100,116,139,.1)'];
+  var ringWeights=[0.6,0.5,0.5];
   for(var r=0;r<rings.length;r++){
-    L.circle([a.lat,a.lon],{radius:rings[r]*1852,color:ringStyle.color,fillColor:'transparent',fillOpacity:0,weight:ringStyle.weight,opacity:ringStyle.opacity,dashArray:ringStyle.dashArray}).addTo(leafMap);
-    // Label at top of each ring
+    L.circle([a.lat,a.lon],{radius:rings[r]*1852,color:ringColors[r],fillColor:'transparent',fillOpacity:0,weight:ringWeights[r],opacity:1,dashArray:'4,6'}).addTo(leafMap);
     var labelLat=a.lat+(rings[r]/60);
-    var labelIcon=L.divIcon({className:'',html:'<span style="font-family:var(--mono);font-size:8px;font-weight:600;color:#94a3b8;background:rgba(255,255,255,.7);padding:0 3px;border-radius:2px">'+rings[r]+'nm</span>',iconSize:[30,12],iconAnchor:[15,6]});
+    var labelIcon=L.divIcon({className:'',html:'<span style="font-family:var(--mono);font-size:7px;font-weight:600;color:rgba(148,163,184,.5);padding:0 2px">'+rings[r]+'</span>',iconSize:[20,10],iconAnchor:[10,5]});
     L.marker([labelLat,a.lon],{icon:labelIcon,interactive:false}).addTo(leafMap);
   }
 }
@@ -967,9 +1047,21 @@ function mkRow(f,cls,done){
   if(cls==='de'){
     var cid=(id).replace(/[^a-zA-Z0-9]/g,'');
     if(done){
-      return '<div class="fr dep-simple"><span class="fi">'+id+csSub+'</span><span class="ft" style="line-height:1.1">'+(typeCode||'—')+typeSub+'</span><span class="'+ffcls+'">'+flag+(flag?' ':'')+(loc||'—')+locSub+'</span><span class="fm">'+(f.depart||'—')+'</span><span class="fm">'+etaStr+'</span></div>';
+      var isHD2=HELI[f.type]?true:false;
+      var sugD2=suggestSpot(f.type,2,isHD2,f.ident);
+      var cidDone=cid;
+      var manSpotD2=window._parkingAssignments&&window._parkingAssignments[cidDone]?window._parkingAssignments[cidDone]:'';
+      var depDoneSpot=manSpotD2||sugD2.spot;
+      var depDoneCell='<span class="fm spot-click" data-plane="'+cidDone+'" style="font-size:9px;font-weight:700;color:var(--cyan);line-height:1.2;cursor:pointer">'+depDoneSpot+'</span>';
+      return '<div class="fr dep-simple"><span class="fi">'+id+csSub+'</span><span class="ft" style="line-height:1.1">'+(typeCode||'—')+typeSub+'</span><span class="'+ffcls+'">'+flag+(flag?' ':'')+(loc||'—')+locSub+'</span><span class="fm">'+(f.depart||'—')+'</span><span class="fm">'+etaStr+'</span>'+depDoneCell+'</div>';
     }
-    return '<div class="fr dep'+rowCls+'"><span class="fi">'+id+csSub+'</span><span class="ft" style="line-height:1.1">'+(typeCode||'—')+typeSub+'</span><span class="'+ffcls+'">'+flag+(flag?' ':'')+(loc||'—')+locSub+'</span><span class="fm">'+(f.depart||'—')+'</span><span class="'+fecls+'">'+etaStr+'</span><input class="chk" type="checkbox" id="cat_'+cid+'" onclick="event.stopPropagation()" /><input class="chk" type="checkbox" id="cip_'+cid+'" onclick="event.stopPropagation()" /><input class="chk" type="checkbox" id="fuel_'+cid+'" onclick="event.stopPropagation()" /><input class="chk" type="checkbox" id="lav_'+cid+'" onclick="event.stopPropagation()" /><input class="chk" type="checkbox" id="h2o_'+cid+'" onclick="event.stopPropagation()" /></div>';
+    // Spot for departure
+    var isHD=HELI[f.type]?true:false;
+    var sugD=suggestSpot(f.type,2,isHD,f.ident);
+    var manSpotD=window._parkingAssignments&&window._parkingAssignments[cid]?window._parkingAssignments[cid]:'';
+    var depSpotText=manSpotD||sugD.spot;
+    var depSpotCell='<span class="fm spot-click" data-plane="'+cid+'" style="font-size:9px;font-weight:700;color:var(--cyan);line-height:1.2;cursor:pointer">'+depSpotText+'</span>';
+    return '<div class="fr dep'+rowCls+'"><span class="fi">'+id+csSub+'</span><span class="ft" style="line-height:1.1">'+(typeCode||'—')+typeSub+'</span><span class="'+ffcls+'">'+flag+(flag?' ':'')+(loc||'—')+locSub+'</span><span class="fm">'+(f.depart||'—')+'</span><span class="'+fecls+'">'+etaStr+'</span>'+depSpotCell+'<input class="chk" type="checkbox" id="cat_'+cid+'" onclick="event.stopPropagation()" /><input class="chk" type="checkbox" id="cip_'+cid+'" onclick="event.stopPropagation()" /><input class="chk" type="checkbox" id="fuel_'+cid+'" onclick="event.stopPropagation()" /><input class="chk" type="checkbox" id="lav_'+cid+'" onclick="event.stopPropagation()" /><input class="chk" type="checkbox" id="h2o_'+cid+'" onclick="event.stopPropagation()" /></div>';
   }
   var paxId='ar_'+(id).replace(/[^a-zA-Z0-9]/g,'');
   // PROGRESS BAR - simple logic:
@@ -981,7 +1073,6 @@ function mkRow(f,cls,done){
   var nowMs=Date.now();
   var depMs=f.departISO?new Date(f.departISO).getTime():0;
   var arrMs=f.arriveISO?new Date(f.arriveISO).getTime():0;
-  if(cls==='ar'&&!done&&f.ident&&depMs>0)console.log('[PROG]',f.ident,'depMs:',depMs,'arrMs:',arrMs,'now:',nowMs,'hasDep:',depMs<nowMs,'pct:',depMs>0&&arrMs>depMs&&depMs<nowMs?Math.round(((nowMs-depMs)/(arrMs-depMs))*100):0);
   if(depMs>0&&depMs<nowMs)hasDep=true;
   if(hasDep&&depMs>0&&arrMs>0){
     if(nowMs>=arrMs){pPct=100;}
@@ -996,19 +1087,49 @@ function mkRow(f,cls,done){
   }
 
   if(done){
-    return '<div class="fr arr-done"><span class="fi">'+id+csSub+'</span><span class="ft" style="line-height:1.1">'+(typeCode||'—')+typeSub+'</span><span class="'+ffcls+'">'+flag+(flag?' ':'')+(loc||'—')+locSub+'</span><span class="fm">'+(f.depart||'—')+'</span><span class="fm">'+(f.arrive||'—')+'</span><span class="'+fecls+'">'+etaStr+'</span></div>';
+    // Spot for arrived aircraft
+    var isH2=HELI[f.type]?true:false;
+    var sug2=suggestSpot(f.type,24,isH2,f.ident);
+    var safeId3=id.replace(/[^a-zA-Z0-9]/g,'');
+    var manSpot2=window._parkingAssignments&&window._parkingAssignments[safeId3]?window._parkingAssignments[safeId3]:'';
+    var arrSpotText=manSpot2||sug2.spot;
+    var arrSpotCell='<span class="fm spot-click" data-plane="'+safeId3+'" style="font-size:9px;font-weight:700;color:var(--cyan);line-height:1.2;cursor:pointer">'+arrSpotText+'</span>';
+    return '<div class="fr arr-done"><span class="fi">'+id+csSub+'</span><span class="ft" style="line-height:1.1">'+(typeCode||'—')+typeSub+'</span><span class="'+ffcls+'">'+flag+(flag?' ':'')+(loc||'—')+locSub+'</span><span class="fm">'+(f.depart||'—')+'</span><span class="fm">'+(f.arrive||'—')+'</span><span class="'+fecls+'">'+etaStr+'</span>'+arrSpotCell+'</div>';
   }
   var enRoute=hasDep&&!done&&!f._landed;
   var gd=enRoute?'<span style="position:absolute;left:4px;top:8px;width:7px;height:7px;border-radius:50%;background:#22c55e;box-shadow:0 0 5px rgba(34,197,94,.5)"></span>':'';
   var safeId=id.replace(/[^a-zA-Z0-9]/g,'');
-  // Calculate suggested parking spot
+  // Calculate suggested parking spot (avoiding already-assigned spots)
   var isH=HELI[f.type]?true:false;
   var stayHrs=24;
-  var sug=suggestSpot(f.type,stayHrs,isH,f.ident);
-  var spotText=sug.spot;
-  if(sug.tow)spotText+='<br><span style="font-size:7px;color:var(--t3)">'+sug.tow+'</span>';
-  if(sug.note)spotText+='<br><span style="font-size:7px;color:var(--amber)">'+sug.note+'</span>';
-  var spotCell='<span class="fm" style="font-size:9px;font-weight:700;color:var(--cyan);line-height:1.2">'+spotText+'</span>';
+  var safeId2=id.replace(/[^a-zA-Z0-9]/g,'');
+  // Check if manually assigned
+  var manualSpot=window._parkingAssignments&&window._parkingAssignments[safeId2]?window._parkingAssignments[safeId2]:'';
+  var finalSpot='';
+  var towNote='';
+  if(manualSpot){
+    finalSpot=manualSpot;
+  } else {
+    var sug=suggestSpot(f.type,stayHrs,isH,f.ident);
+    finalSpot=sug.spot;towNote=sug.tow||'';
+    // If spot already taken, find next available of same type
+    if(window._spotOccupied&&window._spotOccupied[finalSpot]){
+      var cat2=getWsCat(f.type);
+      var alternatives=[];
+      for(var si=0;si<SPOT_DEFS.length;si++){
+        var sd=SPOT_DEFS[si];
+        if(sd.cats.indexOf(cat2)>=0&&!window._spotOccupied[sd.name]&&sd.name!==finalSpot){
+          alternatives.push(sd.name);
+        }
+      }
+      if(alternatives.length>0)finalSpot=alternatives[0];
+    }
+  }
+  // Mark spot as occupied
+  if(window._spotOccupied)window._spotOccupied[finalSpot]=safeId2;
+  var spotText=finalSpot;
+  if(towNote)spotText+='<br><span style="font-size:7px;color:var(--t3)">'+towNote+'</span>';
+  var spotCell='<span class="fm spot-click" data-plane="'+safeId2+'" style="font-size:9px;font-weight:700;color:var(--cyan);line-height:1.2;cursor:pointer">'+spotText+'</span>';
   return '<div class="fr'+rowCls+'"><span class="fi zp" data-zp="'+safeId+'">'+gd+id+csSub+'</span><span class="ft" style="line-height:1.1">'+(typeCode||'—')+typeSub+'</span><span class="'+ffcls+'">'+flag+(flag?' ':'')+(loc||'—')+locSub+'</span><span class="fm">'+(f.depart||'—')+'</span><span class="fm">'+(f.arrive||'—')+'</span><span class="'+fecls+'">'+etaStr+'</span>'+spotCell+'<input class="pax" type="number" min="0" max="99" placeholder="—" id="pax_'+paxId+'" onclick="event.stopPropagation()" /></div>';
 }
 
@@ -1033,10 +1154,11 @@ function calcProgClient(depISO,arrISO){
 function fetchBoards(){
   console.log('[BOARDS] Fetching arrivals...');
   fetch('/fa/arrivals').then(function(r){
-    console.log('[BOARDS] Arrivals response:',r.status);
     return r.json();
   }).then(function(arr){
-    console.log('[BOARDS] Arrivals count:',arr?arr.length:0);
+    // Reset spot trackers for this render cycle
+    window._spotOccupied={};
+    window._globalSpotMap={};
     document.getElementById('ffa').className='fd on';
     var ab=document.getElementById('ab');
     var adb=document.getElementById('adb');
@@ -1214,8 +1336,9 @@ function showGround(){
   document.getElementById('gnd-overlay').style.display='block';
   fetch('/fa/ground').then(function(r){return r.json();}).then(function(g){
     var tb=document.getElementById('gnd-table');
+    window._globalSpotMap={};
     if(!g||!g.length){tb.innerHTML='<p style="text-align:center;color:var(--t3);padding:30px;font-family:var(--mono)">No aircraft on ground</p>';return;}
-    var spotNames=['','Spot A','Spot 1','Spot 2','Spot 3','Spot 4','Spot 5','Hangar A','Hangar B','Hangar C','Btwn Hangars','Ken Salvage','2nd Line','Overflow','3rd Line','The Shop','Airfield Safety','The Island','The Fence','4th Line','42 West'];
+    var spotNames=['','Spot A','Spot 1','Spot 2','Spot 3','Spot 4','Spot 5','Hangar A','Hangar B','Hangar C','Btwn Hangars 1','Btwn Hangars 2','Btwn Hangars 3','Btwn Hangars 4','Ken Salvage','2nd Line','Overflow','3rd Line','The Shop','Airfield Safety','The Island','The Fence','4th Line','42 West 1','42 West 2','42 West 3','42 West 4'];
     var h='<table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px">';
     h+='<tr style="background:var(--b0);font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--t3)"><th style="padding:8px 6px;text-align:left">Tail</th><th>Type</th><th>From</th><th>On Ground</th><th>Next Dest</th><th>Departing</th><th style="min-width:90px">Parked At</th></tr>';
     for(var i=0;i<g.length;i++){
@@ -1260,47 +1383,53 @@ function assignParking(id,spot){
 function closeGround(){document.getElementById('gnd-overlay').style.display='none';}
 
 // === RAMP VIEW ===
-var rampMap=null,rampMarkers=[],rampSpotLabels=[];
+var rampMap=null,rampMarkers=[],rampSpotLabels=[],rampPolygons={},rampLabels={};
 // Spot locations on the Signature SFO ramp (lat/lng from satellite)
 var RAMP_SPOTS={
-'42 West':{lat:37.629191,lng:-122.388245,angle:120},
-'Hangar B':{lat:37.628827,lng:-122.387221,angle:120},
-'Btwn Hangars':{lat:37.628250,lng:-122.386735,angle:120},
-'Hangar C':{lat:37.628231,lng:-122.385973,angle:120},
-'The Island':{lat:37.627653,lng:-122.385350,angle:120},
+'42 West 1':{lat:37.629350,lng:-122.388700,angle:280},
+'42 West 2':{lat:37.629200,lng:-122.388500,angle:280},
+'42 West 3':{lat:37.628900,lng:-122.388250,angle:280},
+'42 West 4':{lat:37.628750,lng:-122.388100,angle:280},
+'Hangar B':{lat:37.628827,lng:-122.387221,angle:280},
+'Btwn Hangars 1':{lat:37.628700,lng:-122.387600,angle:280},
+'Btwn Hangars 2':{lat:37.628450,lng:-122.387100,angle:280},
+'Btwn Hangars 3':{lat:37.628200,lng:-122.386600,angle:280},
+'Btwn Hangars 4':{lat:37.627950,lng:-122.386100,angle:280},
+'Hangar C':{lat:37.628231,lng:-122.385973,angle:280},
+'The Island':{lat:37.627653,lng:-122.385350,angle:280},
 'The Fence':{lat:37.627751,lng:-122.385125,angle:20},
-'Spot 5':{lat:37.627326,lng:-122.384643,angle:120},
-'Spot 4':{lat:37.627568,lng:-122.384458,angle:120},
-'Spot 3':{lat:37.627760,lng:-122.384262,angle:120},
-'Spot 2':{lat:37.627928,lng:-122.384177,angle:120},
-'Spot 1':{lat:37.628096,lng:-122.384092,angle:120},
-'Spot A':{lat:37.628256,lng:-122.383758,angle:90},
-'Hangar A':{lat:37.628585,lng:-122.383650,angle:120},
-'Ken Salvage':{lat:37.628362,lng:-122.383080,angle:120},
-'2nd Line 1':{lat:37.627543,lng:-122.383604,angle:120},
-'2nd Line 2':{lat:37.627737,lng:-122.383482,angle:120},
-'2nd Line 3':{lat:37.627931,lng:-122.383363,angle:120},
-'2nd Line 4':{lat:37.628084,lng:-122.383212,angle:120},
-'Overflow 1':{lat:37.627060,lng:-122.383913,angle:120},
-'Overflow 2':{lat:37.627272,lng:-122.383729,angle:120},
-'3rd Line 1':{lat:37.627275,lng:-122.383044,angle:120},
-'3rd Line 2':{lat:37.627487,lng:-122.382926,angle:120},
-'3rd Line 3':{lat:37.627666,lng:-122.382821,angle:120},
-'3rd Line 4':{lat:37.627842,lng:-122.382658,angle:120},
-'3rd Line 5':{lat:37.628033,lng:-122.382537,angle:120},
-'3rd Line 6':{lat:37.628219,lng:-122.382413,angle:120},
-'3rd Line 7':{lat:37.628422,lng:-122.382279,angle:120},
-'3rd Line 8':{lat:37.628618,lng:-122.382191,angle:120},
-'The Shop':{lat:37.628940,lng:-122.382102,angle:120},
-'Airfield Safety 1':{lat:37.629319,lng:-122.382095,angle:120},
-'Airfield Safety 2':{lat:37.629247,lng:-122.381872,angle:120},
-'41-7 A':{lat:37.626364,lng:-122.382247,angle:120},
-'41-7 B':{lat:37.626241,lng:-122.381951,angle:120},
-'41-11':{lat:37.626503,lng:-122.381747,angle:120},
-'4th Line 1':{lat:37.627172,lng:-122.381724,angle:120},
-'4th Line 2':{lat:37.627632,lng:-122.381463,angle:120},
-'4th Line 3':{lat:37.628093,lng:-122.381203,angle:120},
-'4th Line 4':{lat:37.628553,lng:-122.380942,angle:120}
+'Spot 5':{lat:37.627326,lng:-122.384643,angle:280},
+'Spot 4':{lat:37.627568,lng:-122.384458,angle:280},
+'Spot 3':{lat:37.627760,lng:-122.384262,angle:280},
+'Spot 2':{lat:37.627928,lng:-122.384177,angle:280},
+'Spot 1':{lat:37.628096,lng:-122.384092,angle:280},
+'Spot A':{lat:37.628256,lng:-122.383758,angle:280},
+'Hangar A':{lat:37.628585,lng:-122.383650,angle:280},
+'Ken Salvage':{lat:37.628362,lng:-122.383080,angle:280},
+'2nd Line 1':{lat:37.627543,lng:-122.383604,angle:280},
+'2nd Line 2':{lat:37.627737,lng:-122.383482,angle:280},
+'2nd Line 3':{lat:37.627931,lng:-122.383363,angle:280},
+'2nd Line 4':{lat:37.628084,lng:-122.383212,angle:280},
+'Overflow 1':{lat:37.627060,lng:-122.383913,angle:280},
+'Overflow 2':{lat:37.627272,lng:-122.383729,angle:280},
+'3rd Line 1':{lat:37.627275,lng:-122.383044,angle:280},
+'3rd Line 2':{lat:37.627487,lng:-122.382926,angle:280},
+'3rd Line 3':{lat:37.627666,lng:-122.382821,angle:280},
+'3rd Line 4':{lat:37.627842,lng:-122.382658,angle:280},
+'3rd Line 5':{lat:37.628033,lng:-122.382537,angle:280},
+'3rd Line 6':{lat:37.628219,lng:-122.382413,angle:280},
+'3rd Line 7':{lat:37.628422,lng:-122.382279,angle:280},
+'3rd Line 8':{lat:37.628618,lng:-122.382191,angle:280},
+'The Shop':{lat:37.628940,lng:-122.382102,angle:280},
+'Airfield Safety 1':{lat:37.629319,lng:-122.382095,angle:280},
+'Airfield Safety 2':{lat:37.629247,lng:-122.381872,angle:280},
+'41-7 A':{lat:37.626364,lng:-122.382247,angle:280},
+'41-7 B':{lat:37.626241,lng:-122.381951,angle:280},
+'41-11':{lat:37.626503,lng:-122.381747,angle:280},
+'4th Line 1':{lat:37.627172,lng:-122.381724,angle:280},
+'4th Line 2':{lat:37.627632,lng:-122.381463,angle:280},
+'4th Line 3':{lat:37.628093,lng:-122.381203,angle:280},
+'4th Line 4':{lat:37.628553,lng:-122.380942,angle:280}
 };
 
 function showRampView(){
@@ -1337,28 +1466,28 @@ function showRampView(){
     for(var name in RAMP_SPOTS){
       var s=RAMP_SPOTS[name];
       var col='#f59e0b';
-      if(name==='Btwn Hangars')col='#f59e0b';
+      if(name==='Btwn Hangars 1','Btwn Hangars 2','Btwn Hangars 3','Btwn Hangars 4')col='#f59e0b';
       else if(name.indexOf('Hangar')>=0)col='#8b5cf6';
       else if(name.indexOf('Spot')>=0||name==='Spot A')col='#3b82f6';
       else if(name.indexOf('2nd')>=0)col='#22c55e';
       else if(name.indexOf('3rd')>=0)col='#06b6d4';
       else if(name.indexOf('4th')>=0||name.indexOf('41-')>=0)col='#ef4444';
       else if(name==='Overflow 1'||name==='Overflow 2')col='#f97316';
-      else if(name==='42 West')col='#a855f7';
+      else if(name==='42 West 1','42 West 2','42 West 3','42 West 4')col='#a855f7';
       else if(name==='The Island'||name==='The Fence')col='#64748b';
       // Size bays by spot type - trapezoid: depth, noseW (narrow back), wingW (wide front)
       var depth=40,noseW=10,wingW=30;
-      if(name.indexOf('Hangar')>=0||name==='Btwn Hangars'||true||name==='Spot 1'||name==='Spot 2'||name==='Spot 3'||name==='Spot 4'||name==='Spot 5'){
+      if(name.indexOf('Hangar')>=0||name==='Btwn Hangars 1','Btwn Hangars 2','Btwn Hangars 3','Btwn Hangars 4'||true||name==='Spot 1'||name==='Spot 2'||name==='Spot 3'||name==='Spot 4'||name==='Spot 5'){
         // Custom polygons drawn separately below
       } else {
       if(name.indexOf('Spot 1')>=0||name.indexOf('Spot 2')>=0||name==='Spot A'){depth=35;noseW=8;wingW=22;}
       else if(name.indexOf('Spot 3')>=0){depth=40;noseW=10;wingW=28;}
       else if(name.indexOf('Spot 4')>=0||name.indexOf('Spot 5')>=0){depth=45;noseW=12;wingW=42;}
-      else if(name==='42 West'){depth=0;noseW=0;wingW=0;} // custom polygon drawn separately
+      else if(name==='42 West 1','42 West 2','42 West 3','42 West 4'){depth=0;noseW=0;wingW=0;} // custom polygon drawn separately
       else if(name.indexOf('4th')>=0||name.indexOf('41-')>=0){depth=50;noseW=14;wingW=45;}
       else if(name==='The Island'){depth=48;noseW=12;wingW=42;}
       else if(name.indexOf('Overflow')>=0){depth=45;noseW=12;wingW=40;}
-      else if(name==='Btwn Hangars'){depth=0;noseW=0;wingW=0;} // custom polygon drawn separately
+      else if(name==='Btwn Hangars 1','Btwn Hangars 2','Btwn Hangars 3','Btwn Hangars 4'){depth=0;noseW=0;wingW=0;} // custom polygon drawn separately
       else if(name==='The Shop'||name.indexOf('AFS')>=0||name.indexOf('Airfield')>=0){depth=45;noseW=12;wingW=40;}
       else if(name.indexOf('2nd')>=0){depth=40;noseW=10;wingW=28;}
       else if(name.indexOf('3rd')>=0){depth=40;noseW=10;wingW=28;}
@@ -1368,76 +1497,79 @@ function showRampView(){
       if(name.indexOf('Spot 1')>=0||name.indexOf('Spot 2')>=0)bm=1.10;
       else if(name.indexOf('Spot 4')>=0||name.indexOf('Spot 5')>=0)bm=1.20;
       else if(name.indexOf('4th')>=0||name.indexOf('41-')>=0)bm=1.20;
-      bayPoly(s.lat,s.lng,depth,noseW,wingW,col,fm,bm);
+      bayPoly(s.lat,s.lng,depth,noseW,wingW,col,fm,bm,name);
       }
-      var shortName=name.replace('Airfield Safety','AFS').replace('Ken Salvage','KenS').replace('Btwn Hangars','Btwn Hngrs');
-      var lbl=L.marker([s.lat,s.lng],{interactive:false,icon:L.divIcon({className:'',html:'<div style="font-family:monospace;font-size:8px;font-weight:800;color:#fff;background:'+col+';padding:1px 5px;border-radius:3px;white-space:nowrap;text-align:center;opacity:0.9">'+shortName+'</div>',iconSize:[60,12],iconAnchor:[30,6]})}).addTo(rampMap);
+      var shortName=name.replace('Airfield Safety','AFS').replace('Ken Salvage','KenS').replace('Btwn Hangars 1','Btwn Hangars 2','Btwn Hangars 3','Btwn Hangars 4','Btwn Hngrs');
+      var lbl=L.marker([s.lat,s.lng],{interactive:false,icon:L.divIcon({className:'',html:'<div id="rl_'+name.replace(/[^a-zA-Z0-9]/g,'')+'" style="font-family:monospace;font-size:8px;font-weight:800;color:#22c55e;background:rgba(0,0,0,.75);padding:1px 5px;border-radius:3px;white-space:nowrap;text-align:center">'+shortName+'</div>',iconSize:[80,14],iconAnchor:[40,7]})}).addTo(rampMap);
       rampSpotLabels.push(lbl);
+      if(!window._rampLabelMarkers)window._rampLabelMarkers={};
+      window._rampLabelMarkers[name]=lbl;
+      rampLabels[name]=name.replace(/[^a-zA-Z0-9]/g,'');
     }
     // Custom polygons for specific spots
     // 42 West - custom boundary
-    L.polygon([
+    var _p42West=L.polygon([
       [37.629010,-122.388984],[37.629537,-122.388568],
       [37.629174,-122.387716],[37.628652,-122.388048]
-    ],{color:'#a855f7',weight:2,fillColor:'#a855f7',fillOpacity:0.08}).addTo(rampMap);
+    ],{color:'#a855f7',weight:2,fillColor:'#a855f7',fillOpacity:0.08}).addTo(rampMap);rampPolygons['42 West 1','42 West 2','42 West 3','42 West 4']=_p42West;
     // Between Hangars - custom boundary
-    L.polygon([
+    var _pBtwnHangars=L.polygon([
       [37.628872,-122.387839],[37.628620,-122.388037],
       [37.627600,-122.385645],[37.627848,-122.385444]
-    ],{color:'#f59e0b',weight:2,fillColor:'#f59e0b',fillOpacity:0.08}).addTo(rampMap);
+    ],{color:'#f59e0b',weight:2,fillColor:'#f59e0b',fillOpacity:0.08}).addTo(rampMap);rampPolygons['Btwn Hangars 1','Btwn Hangars 2','Btwn Hangars 3','Btwn Hangars 4']=_pBtwnHangars;
     // Hangar B - custom boundary
-    L.polygon([
+    var _pHangarB=L.polygon([
       [37.629083,-122.387515],[37.628863,-122.387665],
       [37.628546,-122.386927],[37.628769,-122.386773]
-    ],{color:'#8b5cf6',weight:2,fillColor:'#8b5cf6',fillOpacity:0.1}).addTo(rampMap);
+    ],{color:'#8b5cf6',weight:2,fillColor:'#8b5cf6',fillOpacity:0.1}).addTo(rampMap);rampPolygons['Hangar B']=_pHangarB;
     // Hangar C - custom boundary
-    L.polygon([
+    var _pHangarC=L.polygon([
       [37.628477,-122.386187],[37.628248,-122.386333],
       [37.627982,-122.385700],[37.628205,-122.385544]
-    ],{color:'#8b5cf6',weight:2,fillColor:'#8b5cf6',fillOpacity:0.1}).addTo(rampMap);
+    ],{color:'#8b5cf6',weight:2,fillColor:'#8b5cf6',fillOpacity:0.1}).addTo(rampMap);rampPolygons['Hangar C']=_pHangarC;
     // Hangar A - custom boundary
-    L.polygon([
+    var _pHangarA=L.polygon([
       [37.628572,-122.384067],[37.628330,-122.383919],
       [37.628613,-122.383134],[37.628854,-122.383262]
-    ],{color:'#8b5cf6',weight:2,fillColor:'#8b5cf6',fillOpacity:0.1}).addTo(rampMap);
+    ],{color:'#8b5cf6',weight:2,fillColor:'#8b5cf6',fillOpacity:0.1}).addTo(rampMap);rampPolygons['Hangar A']=_pHangarA;
     // The Island - custom boundary
-    L.polygon([
+    var _pTheIsland=L.polygon([
       [37.627782,-122.385426],[37.627610,-122.385536],
       [37.627525,-122.385275],[37.627719,-122.385216]
-    ],{color:'#64748b',weight:2,fillColor:'#64748b',fillOpacity:0.1}).addTo(rampMap);
+    ],{color:'#64748b',weight:2,fillColor:'#64748b',fillOpacity:0.1}).addTo(rampMap);rampPolygons['The Island']=_pTheIsland;
     // The Fence - custom boundary
-    L.polygon([
+    var _pTheFence=L.polygon([
       [37.627811,-122.385142],[37.627722,-122.385190],
       [37.627668,-122.385064],[37.627777,-122.384990]
-    ],{color:'#64748b',weight:2,fillColor:'#64748b',fillOpacity:0.1}).addTo(rampMap);
+    ],{color:'#64748b',weight:2,fillColor:'#64748b',fillOpacity:0.1}).addTo(rampMap);rampPolygons['The Fence']=_pTheFence;
     // Spot A - custom boundary
-    L.polygon([
+    var _pSpotA=L.polygon([
       [37.628326,-122.383791],[37.628280,-122.383674],
       [37.628184,-122.383727],[37.628233,-122.383840]
-    ],{color:'#3b82f6',weight:2,fillColor:'#3b82f6',fillOpacity:0.1}).addTo(rampMap);
+    ],{color:'#3b82f6',weight:2,fillColor:'#3b82f6',fillOpacity:0.1}).addTo(rampMap);rampPolygons['Spot A']=_pSpotA;
 
 
     // Spot 1 - aircraft-shaped bay
-    L.polygon([[37.628157,-122.384169],[37.628119,-122.384197],[37.628038,-122.384167],[37.628038,-122.384035],[37.628086,-122.384000],[37.628176,-122.384066]],{color:'#3b82f6',weight:1.5,fillColor:'#3b82f6',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.628157,-122.384169],[37.628119,-122.384197],[37.628038,-122.384167],[37.628038,-122.384035],[37.628086,-122.384000],[37.628176,-122.384066]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // Spot 2 - aircraft-shaped bay
-    L.polygon([[37.628030,-122.384237],[37.627992,-122.384265],[37.627911,-122.384235],[37.627911,-122.384103],[37.627959,-122.384068],[37.628049,-122.384134]],{color:'#3b82f6',weight:1.5,fillColor:'#3b82f6',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.628030,-122.384237],[37.627992,-122.384265],[37.627911,-122.384235],[37.627911,-122.384103],[37.627959,-122.384068],[37.628049,-122.384134]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // Spot 3 - aircraft-shaped bay
-    L.polygon([[37.627832,-122.384364],[37.627794,-122.384392],[37.627686,-122.384358],[37.627693,-122.384185],[37.627741,-122.384150],[37.627862,-122.384229]],{color:'#3b82f6',weight:1.5,fillColor:'#3b82f6',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.627832,-122.384364],[37.627794,-122.384392],[37.627686,-122.384358],[37.627693,-122.384185],[37.627741,-122.384150],[37.627862,-122.384229]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // Spot 4 - aircraft-shaped bay
-    L.polygon([[37.627663,-122.384609],[37.627625,-122.384637],[37.627463,-122.384595],[37.627482,-122.384340],[37.627530,-122.384305],[37.627715,-122.384411]],{color:'#3b82f6',weight:1.5,fillColor:'#3b82f6',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.627663,-122.384609],[37.627625,-122.384637],[37.627463,-122.384595],[37.627482,-122.384340],[37.627530,-122.384305],[37.627715,-122.384411]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // Spot 5 - aircraft-shaped bay
-    L.polygon([[37.627421,-122.384794],[37.627383,-122.384822],[37.627221,-122.384780],[37.627240,-122.384525],[37.627288,-122.384490],[37.627473,-122.384596]],{color:'#3b82f6',weight:1.5,fillColor:'#3b82f6',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.627421,-122.384794],[37.627383,-122.384822],[37.627221,-122.384780],[37.627240,-122.384525],[37.627288,-122.384490],[37.627473,-122.384596]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
 
     // Spot 1
-    L.polygon([[37.628157,-122.384169],[37.628119,-122.384197],[37.628038,-122.384167],[37.628038,-122.384035],[37.628086,-122.384000],[37.628176,-122.384066]],{color:'#3b82f6',weight:1.5,fillColor:'#3b82f6',fillOpacity:0.08}).addTo(rampMap);
+    var _psSpot1=L.polygon([[37.628157,-122.384169],[37.628119,-122.384197],[37.628038,-122.384167],[37.628038,-122.384035],[37.628086,-122.384000],[37.628176,-122.384066]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);rampPolygons['Spot 1']=_psSpot1;
     // Spot 2
-    L.polygon([[37.627989,-122.384254],[37.627951,-122.384282],[37.627870,-122.384252],[37.627870,-122.384120],[37.627918,-122.384085],[37.628008,-122.384151]],{color:'#3b82f6',weight:1.5,fillColor:'#3b82f6',fillOpacity:0.08}).addTo(rampMap);
+    var _psSpot2=L.polygon([[37.627989,-122.384254],[37.627951,-122.384282],[37.627870,-122.384252],[37.627870,-122.384120],[37.627918,-122.384085],[37.628008,-122.384151]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);rampPolygons['Spot 2']=_psSpot2;
     // Spot 3
-    L.polygon([[37.627832,-122.384364],[37.627794,-122.384392],[37.627686,-122.384358],[37.627693,-122.384185],[37.627741,-122.384150],[37.627862,-122.384229]],{color:'#3b82f6',weight:1.5,fillColor:'#3b82f6',fillOpacity:0.08}).addTo(rampMap);
+    var _psSpot3=L.polygon([[37.627832,-122.384364],[37.627794,-122.384392],[37.627686,-122.384358],[37.627693,-122.384185],[37.627741,-122.384150],[37.627862,-122.384229]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);rampPolygons['Spot 3']=_psSpot3;
     // Spot 4
-    L.polygon([[37.627663,-122.384609],[37.627625,-122.384637],[37.627463,-122.384595],[37.627482,-122.384340],[37.627530,-122.384305],[37.627715,-122.384411]],{color:'#3b82f6',weight:1.5,fillColor:'#3b82f6',fillOpacity:0.08}).addTo(rampMap);
+    var _psSpot4=L.polygon([[37.627663,-122.384609],[37.627625,-122.384637],[37.627463,-122.384595],[37.627482,-122.384340],[37.627530,-122.384305],[37.627715,-122.384411]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);rampPolygons['Spot 4']=_psSpot4;
     // Spot 5
-    L.polygon([[37.627421,-122.384794],[37.627383,-122.384822],[37.627221,-122.384780],[37.627240,-122.384525],[37.627288,-122.384490],[37.627473,-122.384596]],{color:'#3b82f6',weight:1.5,fillColor:'#3b82f6',fillOpacity:0.08}).addTo(rampMap);
+    var _psSpot5=L.polygon([[37.627421,-122.384794],[37.627383,-122.384822],[37.627221,-122.384780],[37.627240,-122.384525],[37.627288,-122.384490],[37.627473,-122.384596]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);rampPolygons['Spot 5']=_psSpot5;
 
     // 2nd Line 1
     L.polygon([[37.627615,-122.383706],[37.627577,-122.383734],[37.627469,-122.383700],[37.627476,-122.383527],[37.627524,-122.383492],[37.627645,-122.383571]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
@@ -1448,47 +1580,47 @@ function showRampView(){
     // 2nd Line 4
     L.polygon([[37.628156,-122.383314],[37.628118,-122.383342],[37.628010,-122.383308],[37.628017,-122.383135],[37.628065,-122.383100],[37.628186,-122.383179]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // Overflow 1
-    L.polygon([[37.627155,-122.384064],[37.627117,-122.384092],[37.626955,-122.384050],[37.626974,-122.383795],[37.627022,-122.383760],[37.627207,-122.383866]],{color:'#f97316',weight:1.5,fillColor:'#f97316',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.627155,-122.384064],[37.627117,-122.384092],[37.626955,-122.384050],[37.626974,-122.383795],[37.627022,-122.383760],[37.627207,-122.383866]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // Overflow 2
-    L.polygon([[37.627367,-122.383880],[37.627329,-122.383908],[37.627167,-122.383866],[37.627186,-122.383611],[37.627234,-122.383576],[37.627419,-122.383682]],{color:'#f97316',weight:1.5,fillColor:'#f97316',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.627367,-122.383880],[37.627329,-122.383908],[37.627167,-122.383866],[37.627186,-122.383611],[37.627234,-122.383576],[37.627419,-122.383682]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // 3rd Line 1
-    L.polygon([[37.627347,-122.383146],[37.627309,-122.383174],[37.627201,-122.383140],[37.627208,-122.382967],[37.627256,-122.382932],[37.627377,-122.383011]],{color:'#06b6d4',weight:1.5,fillColor:'#06b6d4',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.627347,-122.383146],[37.627309,-122.383174],[37.627201,-122.383140],[37.627208,-122.382967],[37.627256,-122.382932],[37.627377,-122.383011]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // 3rd Line 2
-    L.polygon([[37.627559,-122.383028],[37.627521,-122.383056],[37.627413,-122.383022],[37.627420,-122.382849],[37.627468,-122.382814],[37.627589,-122.382893]],{color:'#06b6d4',weight:1.5,fillColor:'#06b6d4',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.627559,-122.383028],[37.627521,-122.383056],[37.627413,-122.383022],[37.627420,-122.382849],[37.627468,-122.382814],[37.627589,-122.382893]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // 3rd Line 3
-    L.polygon([[37.627738,-122.382923],[37.627700,-122.382951],[37.627592,-122.382917],[37.627599,-122.382744],[37.627647,-122.382709],[37.627768,-122.382788]],{color:'#06b6d4',weight:1.5,fillColor:'#06b6d4',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.627738,-122.382923],[37.627700,-122.382951],[37.627592,-122.382917],[37.627599,-122.382744],[37.627647,-122.382709],[37.627768,-122.382788]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // 3rd Line 4
-    L.polygon([[37.627914,-122.382760],[37.627876,-122.382788],[37.627768,-122.382754],[37.627775,-122.382581],[37.627823,-122.382546],[37.627944,-122.382625]],{color:'#06b6d4',weight:1.5,fillColor:'#06b6d4',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.627914,-122.382760],[37.627876,-122.382788],[37.627768,-122.382754],[37.627775,-122.382581],[37.627823,-122.382546],[37.627944,-122.382625]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // 3rd Line 5
-    L.polygon([[37.628105,-122.382639],[37.628067,-122.382667],[37.627959,-122.382633],[37.627966,-122.382460],[37.628014,-122.382425],[37.628135,-122.382504]],{color:'#06b6d4',weight:1.5,fillColor:'#06b6d4',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.628105,-122.382639],[37.628067,-122.382667],[37.627959,-122.382633],[37.627966,-122.382460],[37.628014,-122.382425],[37.628135,-122.382504]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // 3rd Line 6
-    L.polygon([[37.628291,-122.382515],[37.628253,-122.382543],[37.628145,-122.382509],[37.628152,-122.382336],[37.628200,-122.382301],[37.628321,-122.382380]],{color:'#06b6d4',weight:1.5,fillColor:'#06b6d4',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.628291,-122.382515],[37.628253,-122.382543],[37.628145,-122.382509],[37.628152,-122.382336],[37.628200,-122.382301],[37.628321,-122.382380]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // 3rd Line 7
-    L.polygon([[37.628494,-122.382381],[37.628456,-122.382409],[37.628348,-122.382375],[37.628355,-122.382202],[37.628403,-122.382167],[37.628524,-122.382246]],{color:'#06b6d4',weight:1.5,fillColor:'#06b6d4',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.628494,-122.382381],[37.628456,-122.382409],[37.628348,-122.382375],[37.628355,-122.382202],[37.628403,-122.382167],[37.628524,-122.382246]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // 3rd Line 8
-    L.polygon([[37.628690,-122.382293],[37.628652,-122.382321],[37.628544,-122.382287],[37.628551,-122.382114],[37.628599,-122.382079],[37.628720,-122.382158]],{color:'#06b6d4',weight:1.5,fillColor:'#06b6d4',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.628690,-122.382293],[37.628652,-122.382321],[37.628544,-122.382287],[37.628551,-122.382114],[37.628599,-122.382079],[37.628720,-122.382158]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // The Shop
-    L.polygon([[37.629031,-122.382245],[37.628993,-122.382273],[37.628845,-122.382228],[37.628857,-122.381991],[37.628905,-122.381956],[37.629074,-122.382062]],{color:'#f59e0b',weight:1.5,fillColor:'#f59e0b',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.629031,-122.382245],[37.628993,-122.382273],[37.628845,-122.382228],[37.628857,-122.381991],[37.628905,-122.381956],[37.629074,-122.382062]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // Airfield Safety 1
-    L.polygon([[37.629414,-122.382246],[37.629376,-122.382274],[37.629214,-122.382232],[37.629233,-122.381977],[37.629281,-122.381942],[37.629466,-122.382048]],{color:'#f59e0b',weight:1.5,fillColor:'#f59e0b',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.629414,-122.382246],[37.629376,-122.382274],[37.629214,-122.382232],[37.629233,-122.381977],[37.629281,-122.381942],[37.629466,-122.382048]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // Airfield Safety 2
-    L.polygon([[37.629342,-122.382023],[37.629304,-122.382051],[37.629142,-122.382009],[37.629161,-122.381754],[37.629209,-122.381719],[37.629394,-122.381825]],{color:'#f59e0b',weight:1.5,fillColor:'#f59e0b',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.629342,-122.382023],[37.629304,-122.382051],[37.629142,-122.382009],[37.629161,-122.381754],[37.629209,-122.381719],[37.629394,-122.381825]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // Ken Salvage
-    L.polygon([[37.628434,-122.383182],[37.628396,-122.383210],[37.628288,-122.383176],[37.628295,-122.383003],[37.628343,-122.382968],[37.628464,-122.383047]],{color:'#f59e0b',weight:1.5,fillColor:'#f59e0b',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.628434,-122.383182],[37.628396,-122.383210],[37.628288,-122.383176],[37.628295,-122.383003],[37.628343,-122.382968],[37.628464,-122.383047]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // 4th Line 1
-    L.polygon([[37.627267,-122.381875],[37.627229,-122.381903],[37.627067,-122.381861],[37.627086,-122.381606],[37.627134,-122.381571],[37.627319,-122.381677]],{color:'#ef4444',weight:1.5,fillColor:'#ef4444',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.627267,-122.381875],[37.627229,-122.381903],[37.627067,-122.381861],[37.627086,-122.381606],[37.627134,-122.381571],[37.627319,-122.381677]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // 4th Line 2
-    L.polygon([[37.627727,-122.381614],[37.627689,-122.381642],[37.627527,-122.381600],[37.627546,-122.381345],[37.627594,-122.381310],[37.627779,-122.381416]],{color:'#ef4444',weight:1.5,fillColor:'#ef4444',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.627727,-122.381614],[37.627689,-122.381642],[37.627527,-122.381600],[37.627546,-122.381345],[37.627594,-122.381310],[37.627779,-122.381416]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // 4th Line 3
-    L.polygon([[37.628188,-122.381354],[37.628150,-122.381382],[37.627988,-122.381340],[37.628007,-122.381085],[37.628055,-122.381050],[37.628240,-122.381156]],{color:'#ef4444',weight:1.5,fillColor:'#ef4444',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.628188,-122.381354],[37.628150,-122.381382],[37.627988,-122.381340],[37.628007,-122.381085],[37.628055,-122.381050],[37.628240,-122.381156]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // 4th Line 4
-    L.polygon([[37.628648,-122.381093],[37.628610,-122.381121],[37.628448,-122.381079],[37.628467,-122.380824],[37.628515,-122.380789],[37.628700,-122.380895]],{color:'#ef4444',weight:1.5,fillColor:'#ef4444',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.628648,-122.381093],[37.628610,-122.381121],[37.628448,-122.381079],[37.628467,-122.380824],[37.628515,-122.380789],[37.628700,-122.380895]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // 41-7 A
-    L.polygon([[37.626466,-122.382415],[37.626428,-122.382443],[37.626249,-122.382397],[37.626272,-122.382116],[37.626320,-122.382081],[37.626525,-122.382196]],{color:'#ef4444',weight:1.5,fillColor:'#ef4444',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.626466,-122.382415],[37.626428,-122.382443],[37.626249,-122.382397],[37.626272,-122.382116],[37.626320,-122.382081],[37.626525,-122.382196]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // 41-7 B
-    L.polygon([[37.626343,-122.382119],[37.626305,-122.382147],[37.626126,-122.382101],[37.626149,-122.381820],[37.626197,-122.381785],[37.626402,-122.381900]],{color:'#ef4444',weight:1.5,fillColor:'#ef4444',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.626343,-122.382119],[37.626305,-122.382147],[37.626126,-122.382101],[37.626149,-122.381820],[37.626197,-122.381785],[37.626402,-122.381900]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // 41-11
-    L.polygon([[37.626598,-122.381898],[37.626560,-122.381926],[37.626398,-122.381884],[37.626417,-122.381629],[37.626465,-122.381594],[37.626650,-122.381700]],{color:'#ef4444',weight:1.5,fillColor:'#ef4444',fillOpacity:0.08}).addTo(rampMap);
+    L.polygon([[37.626598,-122.381898],[37.626560,-122.381926],[37.626398,-122.381884],[37.626417,-122.381629],[37.626465,-122.381594],[37.626650,-122.381700]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
     // Draw group area outlines for visual clarity
     // First Line outline
     L.polyline([[37.627326,-122.384643],[37.627568,-122.384458],[37.627760,-122.384262],[37.627969,-122.384160],[37.628096,-122.384092],[37.628255,-122.383750]],{color:'#3b82f6',weight:1,opacity:0.4,dashArray:'6,4'}).addTo(rampMap);
@@ -1533,7 +1665,7 @@ function loadRampPlanes(){
       var col=isH?'#22c55e':'#f59e0b';
       var svgPath='M12 2C12.3 2 12.5 3 12.6 4.5L12.8 7.5L18 11C18.4 11.2 18.4 11.6 18 11.8L12.8 10.5L12.9 17L14.8 18.8C15 19 15 19.3 14.8 19.5L12 18.5L9.2 19.5C9 19.3 9 19 9.2 18.8L11.1 17L11.2 10.5L6 11.8C5.6 11.6 5.6 11.2 6 11L11.2 7.5L11.4 4.5C11.5 3 11.7 2 12 2Z';
       if(isH)svgPath='M12 4L14 8L20 9L14 12L14 18L17 20L12 19L7 20L10 18L10 12L4 9L10 8Z';
-      var iconHtml='<div style="text-align:center"><svg width="'+sz+'" height="'+sz+'" viewBox="0 0 24 24" style="transform:rotate('+(spotPos.angle||0)+'deg);filter:drop-shadow(0 1px 3px rgba(0,0,0,.5))"><path d="'+svgPath+'" fill="'+col+'" stroke="#fff" stroke-width="1"/></svg><div style="font-family:monospace;font-size:8px;font-weight:800;color:#fff;text-shadow:0 0 3px #000,0 0 3px #000;white-space:nowrap;margin-top:-2px">'+(f.ident||'?')+'</div><div style="font-family:monospace;font-size:6px;color:#ccc;text-shadow:0 0 2px #000;white-space:nowrap">'+(f.type||'')+(mdl?' '+mdl:'')+'</div></div>';
+      var iconHtml='<div style="text-align:center"><svg width="'+sz+'" height="'+sz+'" viewBox="0 0 24 24" style="transform:rotate(280deg);filter:drop-shadow(0 1px 3px rgba(0,0,0,.5))"><path d="'+svgPath+'" fill="'+col+'" stroke="#fff" stroke-width="1"/></svg><div style="font-family:monospace;font-size:8px;font-weight:800;color:#fff;text-shadow:0 0 3px #000,0 0 3px #000;white-space:nowrap;margin-top:-2px">'+(f.ident||'?')+'</div><div style="font-family:monospace;font-size:6px;color:#ccc;text-shadow:0 0 2px #000;white-space:nowrap">'+(f.type||'')+(mdl?' '+mdl:'')+'</div></div>';
       var icon=L.divIcon({className:'',html:iconHtml,iconSize:[sz+40,sz+20],iconAnchor:[(sz+40)/2,(sz+20)/2]});
       var m=L.marker([jLat,jLng],{icon:icon,draggable:true}).addTo(rampMap);
       m._planeId=safeId;
@@ -1557,9 +1689,306 @@ function loadRampPlanes(){
       });
       rampMarkers.push(m);
     }
+    // Update polygon colors: green=empty, red=occupied
+    window._globalSpotMap={};
+    var occupied={};
+    for(var i=0;i<g.length;i++){
+      var f2=g[i];
+      var sid=(f2.ident||'').replace(/[^a-zA-Z0-9]/g,'');
+      var assigned=window._parkingAssignments&&window._parkingAssignments[sid]?window._parkingAssignments[sid]:'';
+      var isH2=HELI[f2.type]?true:false;
+      var sug2=suggestSpot(f2.type,24,isH2,f2.ident);
+      var spotN=assigned||sug2.spot;
+      occupied[spotN]=true;
+    }
+    for(var pn in rampPolygons){
+      var isOcc=!!occupied[pn];
+      if(isOcc){
+        rampPolygons[pn].setStyle({color:'#ef4444',fillColor:'#ef4444',fillOpacity:0.15});
+      } else {
+        rampPolygons[pn].setStyle({color:'#22c55e',fillColor:'#22c55e',fillOpacity:0.1});
+      }
+      // Update label color
+      if(rampLabels[pn]){
+        var lel=document.getElementById('rl_'+rampLabels[pn]);
+        if(lel)lel.style.color=isOcc?'#ef4444':'#22c55e';
+      }
+    }
   }).catch(function(e){console.error('Ramp load error:',e);});
 }
 function closeRamp(){document.getElementById('ramp-overlay').style.display='none';}
+
+// === 3D AIRSPACE VIEW (Three.js) ===
+var scene3d,camera3d,renderer3d,globe,planeGroup,labelDiv,animId3d=null,cesium3DInterval=null;
+var orbitAngle3d=0,orbitDist=25,orbitTilt=0.7,isDragging3d=false,prevMX=0,prevMY=0;
+var globeRadius=100;
+function latLonToVec3(lat,lon,alt){
+  var phi=(90-lat)*Math.PI/180;
+  var theta=(lon+180)*Math.PI/180;
+  var r=globeRadius+(alt||0)*0.0003;
+  return new THREE.Vector3(-r*Math.sin(phi)*Math.cos(theta),r*Math.cos(phi),r*Math.sin(phi)*Math.sin(theta));
+}
+function show3D(){
+  document.getElementById('cesium-overlay').style.display='block';
+  var ctr=document.getElementById('cesiumContainer');
+  if(!scene3d){
+    scene3d=new THREE.Scene();
+    camera3d=new THREE.PerspectiveCamera(45,ctr.clientWidth/ctr.clientHeight,0.1,1000);
+    renderer3d=new THREE.WebGLRenderer({antialias:true});
+    renderer3d.setSize(ctr.clientWidth,ctr.clientHeight);
+    renderer3d.setPixelRatio(Math.min(window.devicePixelRatio,2));
+    renderer3d.setClearColor(0x050a15);
+    ctr.appendChild(renderer3d.domElement);
+    labelDiv=document.createElement('div');labelDiv.id='plane-labels';ctr.appendChild(labelDiv);
+    // Click handler on overlay for label clicks
+    document.getElementById('cesium-overlay').addEventListener('click',function(ev){
+      var el=ev.target.closest('.plane-label');
+      if(el&&el.dataset.ident){
+        console.log('[3D] Label clicked:',el.dataset.ident);
+        ev.stopPropagation();
+        jumpToFlight(el.dataset.ident);
+      }
+    });
+    // Hi-res globe
+    var geo=new THREE.SphereGeometry(globeRadius,256,256);
+    var loader=new THREE.TextureLoader();loader.crossOrigin='anonymous';
+    var mat=new THREE.MeshPhongMaterial({color:0x4466aa,emissive:0x0a1020,specular:0x222222,shininess:15});
+    globe=new THREE.Mesh(geo,mat);scene3d.add(globe);
+    // Load hi-res earth texture
+    // Load earth texture with fallback chain (CORS-friendly URLs only)
+    function loadTex(url,fallback){
+      loader.load(url,function(tex){
+        tex.anisotropy=renderer3d.capabilities.getMaxAnisotropy();
+        tex.minFilter=THREE.LinearMipmapLinearFilter;tex.magFilter=THREE.LinearFilter;
+        globe.material.map=tex;globe.material.color.setHex(0xffffff);globe.material.needsUpdate=true;
+        console.log('[3D] Earth texture loaded:',url);
+      },undefined,function(err){
+        console.warn('[3D] Texture failed:',url);
+        if(fallback)loadTex(fallback);
+      });
+    }
+    loadTex(
+      'https://unpkg.com/three-globe@2.33.0/example/img/earth-blue-marble.jpg',
+      'https://unpkg.com/three-globe@2.24.4/example/img/earth-blue-marble.jpg'
+    );
+    // Also load night lights overlay for contrast
+    loader.load('https://unpkg.com/three-globe@2.33.0/example/img/earth-night.jpg',function(ntex){
+      ntex.anisotropy=renderer3d.capabilities.getMaxAnisotropy();
+      globe.material.emissiveMap=ntex;globe.material.emissive.setHex(0xffaa44);globe.material.emissiveIntensity=0.15;
+      globe.material.needsUpdate=true;
+      console.log('[3D] Night lights loaded');
+    });
+    // Atmosphere
+    var aGeo=new THREE.SphereGeometry(globeRadius*1.012,64,64);
+    var aMat=new THREE.MeshBasicMaterial({color:0x4488ff,transparent:true,opacity:0.06,side:THREE.BackSide});
+    scene3d.add(new THREE.Mesh(aGeo,aMat));
+    // Lights
+    scene3d.add(new THREE.AmbientLight(0x889aab,1.0));
+    var dl=new THREE.DirectionalLight(0xffffff,1.2);dl.position.set(5,3,5);scene3d.add(dl);
+    // KSFO dot
+    var sp=latLonToVec3(37.6213,-122.3790,300);
+    var sm=new THREE.Mesh(new THREE.SphereGeometry(0.35,16,16),new THREE.MeshBasicMaterial({color:0x3b82f6}));
+    sm.position.copy(sp);scene3d.add(sm);
+    // KSFO label
+    var ksfoLabel=document.createElement('div');
+    ksfoLabel.style.cssText='position:absolute;font:bold 12px monospace;color:#3b82f6;background:rgba(0,0,0,.5);padding:2px 6px;border-radius:3px;pointer-events:none;z-index:51';
+    ksfoLabel.textContent='KSFO';
+    ctr.appendChild(ksfoLabel);
+    window._ksfoLabel=ksfoLabel;window._ksfoPos=sp;
+    // Hi-res OSM tile overlay for Bay Area
+    var tc=document.createElement('canvas');tc.width=2048;tc.height=2048;
+    var tx2d=tc.getContext('2d');
+    var tz=10,btx=160,bty=392,gs=8,tld=0,ttl=gs*gs,tsz=tc.width/gs;
+    for(var tiy=0;tiy<gs;tiy++){for(var tix=0;tix<gs;tix++){(function(txx,tyy){
+      var im=new Image();im.crossOrigin='anonymous';
+      im.onload=function(){
+        tx2d.drawImage(im,txx*tsz,tyy*tsz,tsz,tsz);tld++;
+        if(tld>=ttl){
+          tx2d.globalCompositeOperation='difference';tx2d.fillStyle='white';tx2d.fillRect(0,0,2048,2048);
+          tx2d.globalCompositeOperation='source-over';tx2d.fillStyle='rgba(0,0,20,0.25)';tx2d.fillRect(0,0,2048,2048);
+          var tt=new THREE.CanvasTexture(tc);tt.anisotropy=renderer3d.capabilities.getMaxAnisotropy();
+          var np=Math.PI-2*Math.PI*bty/Math.pow(2,tz);var sp2=Math.PI-2*Math.PI*(bty+gs)/Math.pow(2,tz);
+          var lN=180/Math.PI*Math.atan(0.5*(Math.exp(np)-Math.exp(-np)));
+          var lS=180/Math.PI*Math.atan(0.5*(Math.exp(sp2)-Math.exp(-sp2)));
+          var lW=btx/Math.pow(2,tz)*360-180;var lE=(btx+gs)/Math.pow(2,tz)*360-180;
+          var sw=64,sh=64,vts=[],uv2=[],idx2=[];
+          for(var iy=0;iy<=sh;iy++){for(var ix=0;ix<=sw;ix++){
+            var u2=ix/sw,v2=iy/sh;var la=lN+(lS-lN)*v2;var lo=lW+(lE-lW)*u2;
+            var ph=(90-la)*Math.PI/180;var th=(lo+180)*Math.PI/180;var rr=globeRadius+0.08;
+            vts.push(-rr*Math.sin(ph)*Math.cos(th),rr*Math.cos(ph),rr*Math.sin(ph)*Math.sin(th));
+            uv2.push(u2,1-v2);
+          }}
+          for(var iy=0;iy<sh;iy++){for(var ix=0;ix<sw;ix++){
+            var aa=iy*(sw+1)+ix,bb=aa+1,cc=aa+(sw+1),dd=cc+1;
+            idx2.push(aa,cc,bb,bb,cc,dd);
+          }}
+          var pg=new THREE.BufferGeometry();
+          pg.setAttribute('position',new THREE.Float32BufferAttribute(vts,3));
+          pg.setAttribute('uv',new THREE.Float32BufferAttribute(uv2,2));
+          pg.setIndex(idx2);pg.computeVertexNormals();
+          scene3d.add(new THREE.Mesh(pg,new THREE.MeshBasicMaterial({map:tt})));
+          console.log('[3D] Hi-res tiles loaded');
+        }
+      };
+      im.onerror=function(){tld++;};
+      im.src='https://tile.openstreetmap.org/'+tz+'/'+(btx+txx)+'/'+(bty+tyy)+'.png';
+    })(tix,tiy);}}
+    planeGroup=new THREE.Group();scene3d.add(planeGroup);
+    // === CONTROLS ===
+    var ov=document.getElementById('cesium-overlay');
+    ov.addEventListener('wheel',function(ev){
+      ev.preventDefault();ev.stopPropagation();
+      orbitDist=Math.max(5,Math.min(60,orbitDist+ev.deltaY*0.02));
+    },{passive:false});
+    ov.addEventListener('mousedown',function(ev){isDragging3d=true;prevMX=ev.clientX;prevMY=ev.clientY;});
+    window.addEventListener('mousemove',function(ev){
+      if(!isDragging3d)return;
+      orbitAngle3d+=(ev.clientX-prevMX)*0.004;
+      orbitTilt=Math.max(0.15,Math.min(1.3,orbitTilt-(ev.clientY-prevMY)*0.003));
+      prevMX=ev.clientX;prevMY=ev.clientY;
+    });
+    window.addEventListener('mouseup',function(){isDragging3d=false;});
+    window.addEventListener('resize',function(){
+      if(!renderer3d)return;
+      camera3d.aspect=ctr.clientWidth/ctr.clientHeight;
+      camera3d.updateProjectionMatrix();
+      renderer3d.setSize(ctr.clientWidth,ctr.clientHeight);
+    });
+  }
+  // KSFO position on globe
+  var sfoPos=latLonToVec3(37.6213,-122.3790,0);
+  var sfoN=sfoPos.clone().normalize();
+  // Build tangent frame at SFO
+  var tmpUp=new THREE.Vector3(0,1,0);
+  var tanU=new THREE.Vector3().crossVectors(tmpUp,sfoN).normalize();
+  var tanV=new THREE.Vector3().crossVectors(sfoN,tanU).normalize();
+  function animate3d(){
+    animId3d=requestAnimationFrame(animate3d);
+    if(!isDragging3d)orbitAngle3d+=0.0008;
+    // Camera position: orbit circle on tangent plane + height along normal
+    var cx=Math.cos(orbitAngle3d)*orbitDist;
+    var cy=Math.sin(orbitAngle3d)*orbitDist;
+    var ch=orbitDist*orbitTilt;
+    var camP=sfoPos.clone().add(tanU.clone().multiplyScalar(cx)).add(tanV.clone().multiplyScalar(cy)).add(sfoN.clone().multiplyScalar(ch));
+    camera3d.position.copy(camP);
+    camera3d.up.copy(sfoN);
+    camera3d.lookAt(sfoPos);
+    renderer3d.render(scene3d,camera3d);
+    updateLabels3d();
+    // Update KSFO label position
+    if(window._ksfoLabel&&window._ksfoPos){
+      var kp=window._ksfoPos.clone().project(camera3d);
+      if(kp.z<1){
+        var kx=(kp.x*0.5+0.5)*ctr.clientWidth;
+        var ky=(-kp.y*0.5+0.5)*ctr.clientHeight;
+        window._ksfoLabel.style.left=kx+'px';window._ksfoLabel.style.top=ky+'px';
+        window._ksfoLabel.style.display='block';
+      } else {window._ksfoLabel.style.display='none';}
+    }
+  }
+  animate3d();
+  load3DPlanes();
+  if(cesium3DInterval)clearInterval(cesium3DInterval);
+  cesium3DInterval=setInterval(load3DPlanes,10000);
+}
+var plane3dData={};
+function load3DPlanes(){
+  if(!scene3d||!planeGroup)return;
+  fetch('/osky/states/all?extended=1&'+bboxQS()).then(function(r){return r.json();}).then(function(d){
+    if(!d||!d.states)return;
+    var seen={};
+    for(var i=0;i<d.states.length;i++){
+      var s=d.states[i];var cs=(s[1]||'').trim();
+      var lat=s[6],lon=s[5],alt=s[7]||s[13]||0;
+      if(!lat||!lon)continue;
+      var csUp=cs.toUpperCase().replace(/ /g,'');
+      if(!csUp)continue;
+      var fi=faMapSet[csUp];if(!fi)continue;
+      seen[csUp]=true;
+      var pos=latLonToVec3(lat,lon,alt);
+      var col=fi.type==='arr'?0xf59e0b:0xef4444;
+      if(plane3dData[csUp]){
+        plane3dData[csUp].mesh.position.copy(pos);
+        plane3dData[csUp].glow.position.copy(pos);
+        plane3dData[csUp].trail.push(pos.clone());
+        if(plane3dData[csUp].trail.length>60)plane3dData[csUp].trail.shift();
+        if(plane3dData[csUp].line){planeGroup.remove(plane3dData[csUp].line);plane3dData[csUp].line.geometry.dispose();}
+        if(plane3dData[csUp].trail.length>1){
+          var tG=new THREE.BufferGeometry().setFromPoints(plane3dData[csUp].trail);
+          plane3dData[csUp].line=new THREE.Line(tG,new THREE.LineBasicMaterial({color:col,transparent:true,opacity:0.5}));
+          planeGroup.add(plane3dData[csUp].line);
+        }
+        plane3dData[csUp].label=fi.ident||cs;
+      } else {
+        var pm=new THREE.Mesh(new THREE.SphereGeometry(0.25,8,8),new THREE.MeshBasicMaterial({color:col}));
+        pm.position.copy(pos);planeGroup.add(pm);
+        var gm=new THREE.Mesh(new THREE.SphereGeometry(0.5,8,8),new THREE.MeshBasicMaterial({color:col,transparent:true,opacity:0.25}));
+        gm.position.copy(pos);planeGroup.add(gm);
+        plane3dData[csUp]={mesh:pm,glow:gm,trail:[pos.clone()],line:null,label:fi.ident||cs,col:col};
+      }
+    }
+    for(var k in plane3dData){
+      if(!seen[k]){planeGroup.remove(plane3dData[k].mesh);planeGroup.remove(plane3dData[k].glow);if(plane3dData[k].line)planeGroup.remove(plane3dData[k].line);delete plane3dData[k];}
+    }
+  }).catch(function(e){console.error('3D:',e);});
+}
+function updateLabels3d(){
+  if(!labelDiv||!camera3d)return;
+  var w=renderer3d.domElement.clientWidth,h=renderer3d.domElement.clientHeight;
+  var lbs=[];
+  for(var k in plane3dData){
+    var pd=plane3dData[k];var p=pd.mesh.position.clone();p.project(camera3d);
+    if(p.z>1)continue;
+    var x=(p.x*0.5+0.5)*w,y=(-p.y*0.5+0.5)*h;
+    if(x<-50||x>w+50||y<-50||y>h+50)continue;
+    var fi=faMapSet[k];var eta='';
+    if(fi&&fi.arriveISO){var m=Math.round((new Date(fi.arriveISO).getTime()-Date.now())/60000);if(m>0)eta=m+'m';else if(m>-5)eta='arriving';else eta='landed';}
+    lbs.push({x:x,y:y,lb:pd.label,eta:eta,c:pd.col});
+  }
+  for(var p2=0;p2<3;p2++){for(var i=0;i<lbs.length;i++){for(var j=i+1;j<lbs.length;j++){
+    if(Math.abs(lbs[i].x-lbs[j].x)<90&&Math.abs(lbs[i].y-lbs[j].y)<22){
+      var mid=(lbs[i].y+lbs[j].y)/2;lbs[i].y=mid-12;lbs[j].y=mid+12;
+    }
+  }}}
+  var htm='';
+  for(var i=0;i<lbs.length;i++){
+    var l=lbs[i],ch=l.c===0xf59e0b?'#f59e0b':'#ef4444';
+    var et=l.eta?'<br><span style="font-size:7px;color:'+ch+'">'+l.eta+'</span>':'';
+    htm+='<div class="plane-label" data-ident="'+l.lb.replace(/[^a-zA-Z0-9]/g,'')+'" style="left:'+l.x+'px;top:'+l.y+'px;border-left:2px solid '+ch+'">'+l.lb+et+'</div>';
+  }
+  labelDiv.innerHTML=htm;
+}
+function jumpToFlight(id){
+  console.log('[3D] Jumping to flight:',id);
+  close3D();
+  setTimeout(function(){
+    var found=false;
+    var rows=document.querySelectorAll('.zp');
+    for(var i=0;i<rows.length;i++){
+      if(rows[i].dataset.zp===id){
+        found=true;
+        var r=rows[i].closest('.fr');
+        if(r){
+          r.scrollIntoView({behavior:'smooth',block:'center'});
+          r.style.background='rgba(59,130,246,.3)';
+          r.style.boxShadow='inset 0 0 0 2px #3b82f6';
+          r.style.transition='background 0.3s';
+          var rr=r;
+          setTimeout(function(){rr.style.background='';rr.style.boxShadow='';},4000);
+        }
+        zoomToPlane(id);
+        break;
+      }
+    }
+    if(!found){console.log('Flight not found in board:',id);}
+  },500);
+}
+function close3D(){
+  document.getElementById('cesium-overlay').style.display='none';
+  if(animId3d){cancelAnimationFrame(animId3d);animId3d=null;}
+  if(cesium3DInterval){clearInterval(cesium3DInterval);cesium3DInterval=null;}
+}
+function bboxQS(){var b=bbox();return 'lamin='+b.la1+'&lomin='+b.lo1+'&lamax='+b.la2+'&lomax='+b.lo2;}
 
 // Resize bar drag
 (function(){
