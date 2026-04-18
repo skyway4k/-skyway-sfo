@@ -435,7 +435,7 @@ body{font-family:var(--sans);background:var(--b0);color:var(--t1);min-height:100
 .fi{font-family:var(--mono);font-weight:800;font-size:17px;color:var(--cyan);overflow:visible;text-overflow:ellipsis;white-space:nowrap;line-height:1.2;position:relative;padding-left:16px}
 .fi
 #map .leaflet-tile-pane{filter:invert(1) hue-rotate(180deg) brightness(0.6) contrast(1.2) saturate(0.3)}
-.spot-dd{position:absolute;z-index:100;background:var(--b1);border:1px solid var(--bd);border-radius:4px;box-shadow:0 4px 12px rgba(0,0,0,.2);padding:4px 0;max-height:200px;overflow-y:auto}
+.spot-dd{z-index:10000;background:var(--b1);border:1px solid var(--bd);border-radius:4px;box-shadow:0 4px 12px rgba(0,0,0,.3);padding:4px 0;overflow-y:auto;min-width:140px}
 .spot-dd-item{font-family:var(--mono);font-size:9px;padding:3px 10px;cursor:pointer;color:var(--t1);white-space:nowrap}
 .spot-dd-item:hover{background:var(--blue);color:#fff}
 .zp{cursor:pointer}.fi.zp:hover{color:var(--blue);text-decoration:underline}
@@ -468,7 +468,7 @@ body{font-family:var(--sans);background:var(--b0);color:var(--t1);min-height:100
 .bb .fr:nth-child(odd){background:var(--b1)}
 
 #map .leaflet-tile-pane{filter:invert(1) hue-rotate(180deg) brightness(0.6) contrast(1.2) saturate(0.3)}
-.spot-dd{position:absolute;z-index:100;background:var(--b1);border:1px solid var(--bd);border-radius:4px;box-shadow:0 4px 12px rgba(0,0,0,.2);padding:4px 0;max-height:200px;overflow-y:auto}
+.spot-dd{z-index:10000;background:var(--b1);border:1px solid var(--bd);border-radius:4px;box-shadow:0 4px 12px rgba(0,0,0,.3);padding:4px 0;overflow-y:auto;min-width:140px}
 .spot-dd-item{font-family:var(--mono);font-size:9px;padding:3px 10px;cursor:pointer;color:var(--t1);white-space:nowrap}
 .spot-dd-item:hover{background:var(--blue);color:#fff}
 .zp{cursor:pointer;transition:color .15s}.zp:hover{color:var(--blue)!important;text-decoration:underline}
@@ -558,22 +558,40 @@ var SPOT_DEFS=[
   {name:'Spot 4',cats:[3,4,5],pri:2,qt:true},
   {name:'Spot 5',cats:[3,4,5],pri:2,qt:true},
   {name:'Ken Salvage',cats:[2,3],pri:3,qt:false},
-  {name:'2nd Line',cats:[1,2,3],pri:4,qt:false},
+  {name:'2nd Line 1',cats:[1,2,3],pri:4},
+  {name:'2nd Line 2',cats:[1,2,3],pri:4},
+  {name:'2nd Line 3',cats:[1,2,3],pri:4},
+  {name:'2nd Line 4',cats:[1,2,3],pri:4},
   {name:'Btwn Hangars 1',cats:[4,5],pri:6},
   {name:'Btwn Hangars 2',cats:[4,5],pri:6},
   {name:'Btwn Hangars 3',cats:[4,5],pri:6},
   {name:'Btwn Hangars 4',cats:[4,5],pri:6},
-  {name:'Overflow',cats:[4,5,6],pri:5,qt:false},
-  {name:'3rd Line',cats:[1,2,3,4],pri:5,qt:false},
-  {name:'The Shop',cats:[4,5],pri:6,qt:false},
-  {name:'Airfield Safety',cats:[4,5,6],pri:6,qt:false},
-  {name:'The Island',cats:[4,5],pri:7,qt:false,note:'tow only'},
-  {name:'The Fence',cats:[1,2],pri:7,qt:false,note:'tow only'},
+  {name:'Overflow 1',cats:[4,5],pri:5},
+  {name:'Overflow 2',cats:[4,5],pri:5},
+  {name:'3rd Line 1',cats:[1,2,3],pri:5},
+  {name:'3rd Line 2',cats:[1,2,3],pri:5},
+  {name:'3rd Line 3',cats:[1,2,3],pri:5},
+  {name:'3rd Line 4',cats:[1,2,3],pri:5},
+  {name:'3rd Line 5',cats:[1,2,3],pri:5},
+  {name:'3rd Line 6',cats:[1,2,3],pri:5},
+  {name:'3rd Line 7',cats:[1,2,3],pri:5},
+  {name:'3rd Line 8',cats:[1,2,3],pri:5},
+  {name:'The Shop',cats:[3,4],pri:6},
+  {name:'Airfield Safety 1',cats:[4,5],pri:6},
+  {name:'Airfield Safety 2',cats:[4,5],pri:6},
+  {name:'The Island',cats:[4,5],pri:7,note:'tow only'},
+  {name:'The Fence',cats:[1,2],pri:7,note:'tow only'},
   {name:'42 West 1',cats:[4,5],pri:8},
   {name:'42 West 2',cats:[4,5],pri:8},
   {name:'42 West 3',cats:[4,5],pri:8},
   {name:'42 West 4',cats:[4,5],pri:8},
-  {name:'4th Line',cats:[4,5,6],pri:9,qt:false,note:'call United/Airfield Safety to reserve'}
+  {name:'4th Line 1',cats:[4,5],pri:9},
+  {name:'4th Line 2',cats:[4,5],pri:9},
+  {name:'4th Line 3',cats:[4,5],pri:9},
+  {name:'4th Line 4',cats:[4,5],pri:9},
+  {name:'41-7 A',cats:[4,5,6],pri:9},
+  {name:'41-7 B',cats:[4,5,6],pri:9},
+  {name:'41-11',cats:[4,5],pri:9}
 ];
 // Global spot tracker - shared across all views
 if(!window._globalSpotMap)window._globalSpotMap={};
@@ -634,9 +652,18 @@ function suggestSpot(acType,stayHrs,isHeli,tailNum){
 }
 function getFlag(code){
   if(!code||code.length<2)return'';
+  // US FAA identifiers: 3 chars, often start with number or non-K letter
+  // These are US airports that don't follow ICAO format
+  if(code.length<=3){
+    // If it starts with a digit, it's US
+    if(code.charAt(0)>='0'&&code.charAt(0)<='9')return'🇺🇸';
+    // 3-char codes starting with letters that aren't standard ICAO prefixes are usually US
+    // Known US FAA prefixes that aren't K: letter+digits like O89, L35, S50, etc
+    var ch=code.charAt(0).toUpperCase();
+    if(code.length===3&&'ABCDEFGHIJLNOQRSTUW'.indexOf(ch)>=0&&code.charAt(1)>='0'&&code.charAt(1)<='9')return'🇺🇸';
+  }
   var p=code.substring(0,1).toUpperCase();
   var FLAGS={K:'🇺🇸',P:'🇺🇸',C:'🇨🇦',M:'🇲🇽',T:'🇲🇽',L:'🇪🇺',E:'🇪🇺',U:'🇷🇺',Z:'🇨🇳',R:'🇰🇷',V:'🇦🇺',S:'🇧🇷',Y:'🇦🇺',O:'🇯🇵',W:'🇮🇩',F:'🇿🇦',H:'🇪🇬',D:'🇩🇪',B:'🇮🇨'};
-  // More specific 2-char prefixes
   var p2=code.substring(0,2).toUpperCase();
   var F2={EG:'🇬🇧',LF:'🇫🇷',ED:'🇩🇪',LI:'🇮🇹',LE:'🇪🇸',EH:'🇳🇱',EB:'🇧🇪',LS:'🇨🇭',LO:'🇦🇹',EK:'🇩🇰',EN:'🇳🇴',ES:'🇸🇪',EF:'🇫🇮',EI:'🇮🇪',LP:'🇵🇹',LG:'🇬🇷',LT:'🇹🇷',LK:'🇨🇿',EP:'🇵🇱',LH:'🇭🇺',LR:'🇷🇴',OE:'🇦🇪',OB:'🇧🇭',OK:'🇰🇼',OI:'🇮🇷',OL:'🇱🇧',OJ:'🇯🇴',LL:'🇮🇱',OO:'🇸🇦',OP:'🇵🇰',VI:'🇮🇳',VE:'🇮🇳',VA:'🇮🇳',RJ:'🇯🇵',RK:'🇰🇷',RC:'🇹🇼',VH:'🇭🇰',WS:'🇸🇬',ZS:'🇨🇳',ZB:'🇨🇳',ZG:'🇨🇳',PH:'🇺🇸',PA:'🇺🇸',SB:'🇧🇷',SC:'🇨🇱',SK:'🇨🇴',SE:'🇪🇨',SP:'🇵🇪',SV:'🇻🇪',TJ:'🇵🇷',TN:'🇦🇼',MK:'🇯🇲',MM:'🇲🇽',MU:'🇨🇺',MY:'🇧🇸',NT:'🇵🇫',NZ:'🇳🇿',YM:'🇦🇺',CY:'🇨🇦',CZ:'🇨🇦',FA:'🇿🇦',FI:'🇿🇦',DN:'🇳🇬',HA:'🇪🇹',HR:'🇪🇬',HB:'🇪🇹',HK:'🇰🇪'};
   return F2[p2]||FLAGS[p]||'';
@@ -710,6 +737,7 @@ window.onload=function(){
   // Spot click - inline dropdown
   document.addEventListener('click',function(e){
     var el=e.target.closest('.spot-click');
+    console.log('[SPOT] Click detected, el:',el?el.dataset.plane:'none');
     // Close any existing dropdown first
     var old=document.querySelector('.spot-dd');if(old)old.remove();
     if(!el)return;
@@ -717,7 +745,18 @@ window.onload=function(){
     var planeId=el.dataset.plane;
     var rect=el.getBoundingClientRect();
     var dd=document.createElement('div');dd.className='spot-dd';
-    dd.style.left=rect.left+'px';dd.style.top=rect.bottom+'px';
+    dd.style.position='fixed';dd.style.left=rect.left+'px';
+    // Determine if dropdown should open up or down based on available space
+    var spaceBelow=window.innerHeight-rect.bottom;
+    var spaceAbove=rect.top;
+    if(spaceBelow<250&&spaceAbove>250){
+      // Open upward
+      dd.style.bottom=(window.innerHeight-rect.top)+'px';
+      dd.style.maxHeight=(rect.top-20)+'px';
+    } else {
+      dd.style.top=rect.bottom+'px';
+      dd.style.maxHeight=(window.innerHeight-rect.bottom-20)+'px';
+    }
     var spotNames=['Spot A','Spot 1','Spot 2','Spot 3','Spot 4','Spot 5','Ken Salvage','2nd Line 1','2nd Line 2','2nd Line 3','2nd Line 4','Overflow 1','Overflow 2','Btwn Hangars 1','Btwn Hangars 2','Btwn Hangars 3','Btwn Hangars 4','3rd Line 1','3rd Line 2','3rd Line 3','3rd Line 4','3rd Line 5','3rd Line 6','3rd Line 7','3rd Line 8','The Shop','Airfield Safety 1','Airfield Safety 2','4th Line 1','4th Line 2','4th Line 3','4th Line 4','41-7 A','41-7 B','41-11','42 West 1','42 West 2','42 West 3','42 West 4','The Island','The Fence','Hangar A','Hangar B','Hangar C'];
     for(var i=0;i<spotNames.length;i++){
       var item=document.createElement('div');item.className='spot-dd-item';
@@ -1338,7 +1377,7 @@ function showGround(){
     var tb=document.getElementById('gnd-table');
     window._globalSpotMap={};
     if(!g||!g.length){tb.innerHTML='<p style="text-align:center;color:var(--t3);padding:30px;font-family:var(--mono)">No aircraft on ground</p>';return;}
-    var spotNames=['','Spot A','Spot 1','Spot 2','Spot 3','Spot 4','Spot 5','Hangar A','Hangar B','Hangar C','Btwn Hangars 1','Btwn Hangars 2','Btwn Hangars 3','Btwn Hangars 4','Ken Salvage','2nd Line','Overflow','3rd Line','The Shop','Airfield Safety','The Island','The Fence','4th Line','42 West 1','42 West 2','42 West 3','42 West 4'];
+    var spotNames=['','Spot A','Spot 1','Spot 2','Spot 3','Spot 4','Spot 5','Ken Salvage','2nd Line 1','2nd Line 2','2nd Line 3','2nd Line 4','Overflow 1','Overflow 2','Btwn Hangars 1','Btwn Hangars 2','Btwn Hangars 3','Btwn Hangars 4','3rd Line 1','3rd Line 2','3rd Line 3','3rd Line 4','3rd Line 5','3rd Line 6','3rd Line 7','3rd Line 8','The Shop','Airfield Safety 1','Airfield Safety 2','4th Line 1','4th Line 2','4th Line 3','4th Line 4','41-7 A','41-7 B','41-11','42 West 1','42 West 2','42 West 3','42 West 4','The Island','The Fence','Hangar A','Hangar B','Hangar C'];
     var h='<table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px">';
     h+='<tr style="background:var(--b0);font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--t3)"><th style="padding:8px 6px;text-align:left">Tail</th><th>Type</th><th>From</th><th>On Ground</th><th>Next Dest</th><th>Departing</th><th style="min-width:90px">Parked At</th></tr>';
     for(var i=0;i<g.length;i++){
@@ -1690,11 +1729,15 @@ function loadRampPlanes(){
           if(d<minDist){minDist=d;nearest=sn;}
         }
         if(nearest){
+          if(!window._parkingAssignments)window._parkingAssignments={};
           window._parkingAssignments[e.target._planeId]=nearest;
-          console.log('Moved '+e.target._planeName+' to '+nearest);
           // Snap to spot
           var sp2=RAMP_SPOTS[nearest];
-          e.target.setLatLng([sp2.lat+(Math.random()-0.5)*0.00006,sp2.lng+(Math.random()-0.5)*0.00006]);
+          e.target.setLatLng([sp2.lat,sp2.lng]);
+          // Immediately update occupancy colors
+          if(!window._lastOccupied)window._lastOccupied={};
+          window._lastOccupied[nearest]=e.target._planeId;
+          updateRampColors();
         }
       });
       rampMarkers.push(m);
