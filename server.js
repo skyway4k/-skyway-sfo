@@ -438,6 +438,8 @@ body{font-family:var(--sans);background:var(--b0);color:var(--t1);min-height:100
 .spot-dd{z-index:10000;background:var(--b1);border:1px solid var(--bd);border-radius:4px;box-shadow:0 4px 12px rgba(0,0,0,.3);padding:4px 0;overflow-y:auto;min-width:140px}
 .spot-dd-item{font-family:var(--mono);font-size:9px;padding:3px 10px;cursor:pointer;color:var(--t1);white-space:nowrap}
 .spot-dd-item:hover{background:var(--blue);color:#fff}
+.spot-dd-item:first-child{color:#ef4444;border-bottom:1px solid var(--bd);font-weight:700}
+.spot-dd-item:first-child:hover{background:#ef4444;color:#fff}
 .zp{cursor:pointer}.fi.zp:hover{color:var(--blue);text-decoration:underline}
 .fi .sub{font-size:9px;font-weight:500;color:var(--t3);display:block}
 .ft{font-family:var(--mono);font-size:16px;font-weight:700;color:var(--t1);text-align:center;line-height:1.2}
@@ -471,12 +473,16 @@ body{font-family:var(--sans);background:var(--b0);color:var(--t1);min-height:100
 .spot-dd{z-index:10000;background:var(--b1);border:1px solid var(--bd);border-radius:4px;box-shadow:0 4px 12px rgba(0,0,0,.3);padding:4px 0;overflow-y:auto;min-width:140px}
 .spot-dd-item{font-family:var(--mono);font-size:9px;padding:3px 10px;cursor:pointer;color:var(--t1);white-space:nowrap}
 .spot-dd-item:hover{background:var(--blue);color:#fff}
+.spot-dd-item:first-child{color:#ef4444;border-bottom:1px solid var(--bd);font-weight:700}
+.spot-dd-item:first-child:hover{background:#ef4444;color:#fff}
 .zp{cursor:pointer;transition:color .15s}.zp:hover{color:var(--blue)!important;text-decoration:underline}
 .leaflet-popup-content-wrapper{background:rgba(15,23,42,.85)!important;color:#e2e8f0!important;border-radius:6px!important;box-shadow:0 2px 8px rgba(0,0,0,.4)!important;font-size:9px!important;padding:0!important}
 .leaflet-popup-content{margin:6px 8px!important;color:#e2e8f0!important}
 .leaflet-popup-tip{background:rgba(15,23,42,.85)!important}
+img.emoji{height:1em;width:1em;margin:0 .05em 0 .1em;vertical-align:-0.1em;display:inline-block}
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/twemoji.min.js" crossorigin="anonymous"></script>
 <style>
 #cesium-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;z-index:9997;background:#050a15}
 #cesiumContainer{width:100%;height:100%;overflow:hidden}
@@ -757,16 +763,47 @@ window.onload=function(){
       dd.style.top=rect.bottom+'px';
       dd.style.maxHeight=(window.innerHeight-rect.bottom-20)+'px';
     }
-    var spotNames=['Spot A','Spot 1','Spot 2','Spot 3','Spot 4','Spot 5','Ken Salvage','2nd Line 1','2nd Line 2','2nd Line 3','2nd Line 4','Overflow 1','Overflow 2','Btwn Hangars 1','Btwn Hangars 2','Btwn Hangars 3','Btwn Hangars 4','3rd Line 1','3rd Line 2','3rd Line 3','3rd Line 4','3rd Line 5','3rd Line 6','3rd Line 7','3rd Line 8','The Shop','Airfield Safety 1','Airfield Safety 2','4th Line 1','4th Line 2','4th Line 3','4th Line 4','41-7 A','41-7 B','41-11','42 West 1','42 West 2','42 West 3','42 West 4','The Island','The Fence','Hangar A','Hangar B','Hangar C'];
+    var spotNames=['⚡ DEPARTED','Spot A','Spot 1','Spot 2','Spot 3','Spot 4','Spot 5','Ken Salvage','2nd Line 1','2nd Line 2','2nd Line 3','2nd Line 4','Overflow 1','Overflow 2','Btwn Hangars 1','Btwn Hangars 2','Btwn Hangars 3','Btwn Hangars 4','3rd Line 1','3rd Line 2','3rd Line 3','3rd Line 4','3rd Line 5','3rd Line 6','3rd Line 7','3rd Line 8','The Shop','Airfield Safety 1','Airfield Safety 2','4th Line 1','4th Line 2','4th Line 3','4th Line 4','41-7 A','41-7 B','41-11','42 West 1','42 West 2','42 West 3','42 West 4','The Island','The Fence','Hangar A','Hangar B','Hangar C'];
+    // Build current spot occupancy map from all sources
+    var spotsTaken={};
+    if(window._parkingAssignments){
+      for(var pk in window._parkingAssignments){
+        if(pk!==planeId&&!window._manuallyDeparted[pk]){
+          spotsTaken[window._parkingAssignments[pk]]=true;
+        }
+      }
+    }
+    if(window._manualOccupied){
+      for(var mk in window._manualOccupied)spotsTaken[mk]=true;
+    }
+    if(window._lastOccupied){
+      for(var lk in window._lastOccupied){
+        if(window._lastOccupied[lk]!==planeId)spotsTaken[lk]=true;
+      }
+    }
     for(var i=0;i<spotNames.length;i++){
+      // Skip occupied spots (but keep the DEPARTED option always)
+      if(spotNames[i]!=='⚡ DEPARTED'&&spotsTaken[spotNames[i]])continue;
       var item=document.createElement('div');item.className='spot-dd-item';
       item.textContent=spotNames[i];item.dataset.spot=spotNames[i];
       item.addEventListener('click',function(ev){
         ev.stopPropagation();
         var newSpot=ev.target.dataset.spot;
-        if(!window._parkingAssignments)window._parkingAssignments={};
-        window._parkingAssignments[planeId]=newSpot;
-        el.innerHTML=newSpot;
+        if(newSpot==='⚡ DEPARTED'){
+          // Mark as manually departed - remove from all views
+          if(!window._manuallyDeparted)window._manuallyDeparted={};
+          window._manuallyDeparted[planeId]=true;
+          if(window._parkingAssignments)delete window._parkingAssignments[planeId];
+          // Trigger board refresh
+          if(typeof fetchBoards==='function')fetchBoards();
+          // Hide the row immediately
+          var row=el.closest('.fr');
+          if(row)row.style.display='none';
+        } else {
+          if(!window._parkingAssignments)window._parkingAssignments={};
+          window._parkingAssignments[planeId]=newSpot;
+          el.innerHTML=newSpot;
+        }
         dd.remove();
       });
       dd.appendChild(item);
@@ -1206,6 +1243,8 @@ function fetchBoards(){
     var now=Date.now();
     if(arr)for(var i=0;i<arr.length;i++){
       var f=arr[i];
+      var _depId=(f.ident||'').replace(/[^a-zA-Z0-9]/g,'');
+      if(window._manuallyDeparted&&window._manuallyDeparted[_depId])continue;
       var arrTime=f.arriveISO?new Date(f.arriveISO).getTime():0;
       var minsSinceArr=arrTime>0?Math.round((now-arrTime)/60000):-999;
       if(f.arrived||minsSinceArr>5){
@@ -1227,14 +1266,14 @@ function fetchBoards(){
       var h='';
       for(var i=0;i<Math.min(active.length,30);i++){h+=mkRow(active[i],'ar',false);}
       ab.innerHTML=h;
-      document.getElementById('anc').textContent=active.length;
+      document.getElementById('anc').textContent=active.length;if(window.twemoji)twemoji.parse(ab);
     }else{ab.innerHTML='<div class="empty">No inbound GA</div>';document.getElementById('anc').textContent='0';}
     if(completed.length>0){
       ah.style.display='';adb.style.display='';
       var ahc=document.getElementById('ahcols');if(ahc)ahc.style.display='';
       var h='';
       for(var i=0;i<Math.min(completed.length,20);i++){h+=mkRow(completed[i],'ar',true);}
-      adb.innerHTML=h;document.getElementById('adc').textContent=completed.length;
+      adb.innerHTML=h;document.getElementById('adc').textContent=completed.length;if(window.twemoji)twemoji.parse(adb);
     }else{ah.style.display='none';adb.style.display='none';var ahc=document.getElementById('ahcols');if(ahc)ahc.style.display='none';}
   }).catch(function(e){console.warn('FA arr:',e);});
 
@@ -1263,7 +1302,7 @@ function fetchBoards(){
       var dhc=document.getElementById('dhcols');if(dhc)dhc.style.display='';
       var h='';
       for(var i=0;i<Math.min(completed.length,20);i++){h+=mkRow(completed[i],'de',true);}
-      ddb.innerHTML=h;document.getElementById('ddc').textContent=completed.length;
+      ddb.innerHTML=h;document.getElementById('ddc').textContent=completed.length;if(window.twemoji)twemoji.parse(ddb);
     }else{dh.style.display='none';ddb.style.display='none';var dhc=document.getElementById('dhcols');if(dhc)dhc.style.display='none';}
   }).catch(function(e){console.warn('FA dep:',e);});
   setTimeout(drawHUD,500);
@@ -1382,6 +1421,8 @@ function showGround(){
     h+='<tr style="background:var(--b0);font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--t3)"><th style="padding:8px 6px;text-align:left">Tail</th><th>Type</th><th>From</th><th>On Ground</th><th>Next Dest</th><th>Departing</th><th style="min-width:90px">Parked At</th></tr>';
     for(var i=0;i<g.length;i++){
       var f=g[i];
+      var _depGnd=(f.ident||'').replace(/[^a-zA-Z0-9]/g,'');
+      if(window._manuallyDeparted&&window._manuallyDeparted[_depGnd])continue;
       var fromStr=(f.from||'—')+(f.city?' <span style="color:var(--t3);font-size:9px">'+f.city+'</span>':'')+(f.country?' <span style="color:var(--red);font-size:9px">'+f.country+'</span>':'');
       var typeStr=(f.type||'—');
       var mdl=MODEL[f.type]||'';
@@ -1415,6 +1456,7 @@ function showGround(){
 }
 // Parking assignments stored in memory
 if(!window._parkingAssignments)window._parkingAssignments={};
+if(!window._manuallyDeparted)window._manuallyDeparted={};
 function assignParking(id,spot){
   if(!id&&this&&this.dataset)id=this.dataset.id;
   window._parkingAssignments[id]=spot;
@@ -1696,6 +1738,7 @@ function loadRampPlanes(){
     for(var i=0;i<g.length;i++){
       var f=g[i];
       var safeId=(f.ident||'').replace(/[^a-zA-Z0-9]/g,'');
+      if(window._manuallyDeparted&&window._manuallyDeparted[safeId])continue;
       // Determine spot - use manual assignment or suggestion
       var assigned=window._parkingAssignments&&window._parkingAssignments[safeId]?window._parkingAssignments[safeId]:'';
       var isH=HELI[f.type]?true:false;
