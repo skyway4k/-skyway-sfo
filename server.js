@@ -2,19 +2,26 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const url = require('url');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 8766, WS_PORT = 8765;
-const OSKY_ID = 'skyway-api-client';
-const OSKY_SECRET = 'TzrrCV2IoPlIqmRiRcpUIVscZQheFBQS';
+// Credentials - prefer env vars, fall back to hardcoded for backward compat
+// Production deployments SHOULD set these as env vars and rotate regularly
+const OSKY_ID = process.env.OSKY_ID || 'skyway-api-client';
+const OSKY_SECRET = process.env.OSKY_SECRET || 'TzrrCV2IoPlIqmRiRcpUIVscZQheFBQS';
 const TOKEN_URL = 'https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token';
 
 // FAA SWIM SCDS
-const SWIM_USER = 'skyway.4k.gmail.com';
+const SWIM_USER = process.env.SWIM_USER || 'skyway.4k.gmail.com';
 const SWIM_PASS = process.env.SWIM_PASS || 'V3_iPPvMTtGptG8MiwKNaw';
-const SWIM_QUEUE = 'skyway.4k.gmail.com.FDPS.019d315a-6ec1-4b83-a699-413b0d0c8012.OUT';
+const SWIM_QUEUE = process.env.SWIM_QUEUE || 'skyway.4k.gmail.com.FDPS.019d315a-6ec1-4b83-a699-413b0d0c8012.OUT';
 const SWIM_URL = 'tcps://ems2.swim.faa.gov:55443';
 const SWIM_VPN = 'FDPS';
+
+// Warn operators if any key is still using the bundled default
+if(!process.env.OSKY_SECRET)console.warn('[SECURITY] OSKY_SECRET not set in env - using bundled default. Set env var in production.');
+if(!process.env.SWIM_PASS)console.warn('[SECURITY] SWIM_PASS not set in env - using bundled default. Set env var in production.');
 
 let oskyToken = null, oskyExp = 0;
 let wsClients = new Set();
@@ -27,12 +34,120 @@ async function getToken(){
     const r=await fetch(TOKEN_URL,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:`grant_type=client_credentials&client_id=${encodeURIComponent(OSKY_ID)}&client_secret=${encodeURIComponent(OSKY_SECRET)}`});
     if(!r.ok)throw new Error('HTTP '+r.status);
     const d=await r.json();oskyToken=d.access_token;oskyExp=Date.now()+(d.expires_in||1800)*1000;
-    log('OpenSky token OK','OK');return oskyToken;
-  }catch(e){log('Token error: '+e.message,'ERR');return null;}
+    log('OpenSky token OK (authenticated tier: 4000 credits/day)','OK');
+    oskyAuthMode='authenticated';
+    return oskyToken;
+  }catch(e){
+    log('[OSKY AUTH] Token fetch failed: '+e.message+' — falling back to ANONYMOUS tier (400 credits/day!)','ERR');
+    oskyAuthMode='anonymous';
+    OSKY_DAILY_BUDGET=400;
+    return null;
+  }
+}
+
+// Server-side OpenSky response cache — eliminates duplicate calls from multiple clients / views
+// OpenSky rate-limits by IP, so caching at the server is essential for multi-browser usage
+var oskyCache = {}; // key: apiPath, value: {body, status, ts}
+var OSKY_CACHE_TTL = 30000; // 30s cache — keeps daily burn under 4000 credit budget at 1 cr/call (800nm bbox)
+var oskyBackoffUntil = 0; // Unix timestamp — if set, we serve cached data and refuse to hit OpenSky
+
+// === OpenSky credit tracking ===
+// Per their public pricing, each /states/all call costs credits based on bbox area:
+//   no bbox or <=25 sq deg => 4 credits
+//   25-100 sq deg => 3 credits
+//   100-400 sq deg => 2 credits
+//   >400 sq deg => 1 credit
+// We track a rolling 24-hour window. Free anonymous: 400/day. Free authenticated: 4000/day.
+var oskyCreditsSpent = []; // array of {ts, cost, reason}
+var OSKY_DAILY_BUDGET = 4000; // assume authenticated free tier unless told otherwise
+var oskyAuthMode = 'unknown'; // 'authenticated' | 'anonymous' | 'unknown'
+var oskyLastSuccess = 0;
+var oskyLast429 = 0;
+// Authoritative values pulled from OpenSky's own response headers — these supersede our estimates.
+var oskyRemainingFromHeader = null; // X-Rate-Limit-Remaining (credits left today)
+var oskyRetryAfterUntil = 0;        // derived from X-Rate-Limit-Retry-After-Seconds (ms timestamp)
+function calcCreditCost(apiPath){
+  // Parse bbox from query string
+  var m=apiPath.match(/lamin=([\-0-9.]+)&lomin=([\-0-9.]+)&lamax=([\-0-9.]+)&lomax=([\-0-9.]+)/);
+  if(!m)return 4; // no bbox = max cost
+  var latSpan=Math.abs(parseFloat(m[3])-parseFloat(m[1]));
+  var lonSpan=Math.abs(parseFloat(m[4])-parseFloat(m[2]));
+  var sqDeg=latSpan*lonSpan;
+  if(sqDeg<=25)return 4;
+  if(sqDeg<=100)return 3;
+  if(sqDeg<=400)return 2;
+  return 1;
+}
+function recordCredit(apiPath,cost){
+  var now=Date.now();
+  // Prune anything older than 24 hours
+  var cutoff=now-86400000;
+  while(oskyCreditsSpent.length>0&&oskyCreditsSpent[0].ts<cutoff)oskyCreditsSpent.shift();
+  oskyCreditsSpent.push({ts:now,cost:cost,path:apiPath});
+}
+function getCreditSummary(){
+  var now=Date.now();
+  var cutoff=now-86400000;
+  while(oskyCreditsSpent.length>0&&oskyCreditsSpent[0].ts<cutoff)oskyCreditsSpent.shift();
+  var total=0,hourTotal=0,hourCutoff=now-3600000;
+  for(var i=0;i<oskyCreditsSpent.length;i++){
+    total+=oskyCreditsSpent[i].cost;
+    if(oskyCreditsSpent[i].ts>=hourCutoff)hourTotal+=oskyCreditsSpent[i].cost;
+  }
+  var budget=oskyAuthMode==='anonymous'?400:OSKY_DAILY_BUDGET;
+  // Prefer the authoritative X-Rate-Limit-Remaining value from OpenSky when available.
+  // Fall back to our own estimate (budget - total) when we haven't seen a header yet.
+  var remaining;
+  var remainingSource;
+  if(oskyRemainingFromHeader!==null){
+    remaining=oskyRemainingFromHeader;
+    remainingSource='opensky-header';
+  } else {
+    remaining=Math.max(0,budget-total);
+    remainingSource='estimate';
+  }
+  // Countdown: prefer OpenSky's retry-after header. Fall back to our 60s backoff.
+  var backoffSec=0;
+  var backoffSource='none';
+  if(oskyRetryAfterUntil>now){
+    backoffSec=Math.ceil((oskyRetryAfterUntil-now)/1000);
+    backoffSource='opensky-header';
+  } else if(oskyBackoffUntil>now){
+    backoffSec=Math.ceil((oskyBackoffUntil-now)/1000);
+    backoffSource='local-estimate';
+  }
+  return {
+    spent24h:total,
+    budget:budget,
+    remaining:remaining,
+    remainingSource:remainingSource,
+    spentLastHour:hourTotal,
+    callCount24h:oskyCreditsSpent.length,
+    authMode:oskyAuthMode,
+    inBackoff:backoffSec>0,
+    backoffSecondsRemaining:backoffSec,
+    backoffSource:backoffSource,
+    lastSuccessAgo:oskyLastSuccess?Math.round((now-oskyLastSuccess)/1000):null,
+    last429Ago:oskyLast429?Math.round((now-oskyLast429)/1000):null
+  };
 }
 
 async function proxyOsky(apiPath,res){
   try{
+    var nowT=Date.now();
+    var cached=oskyCache[apiPath];
+    // Serve from cache if fresh, or if we're in 429 backoff and have any cached data
+    if(cached&&(nowT-cached.ts<OSKY_CACHE_TTL||nowT<oskyBackoffUntil)){
+      res.writeHead(cached.status,{'Content-Type':'application/json','Access-Control-Allow-Origin':'*','X-Cache':'HIT'});
+      res.end(cached.body);
+      return;
+    }
+    // If we're in backoff and have NO cached data for this path, tell the client with 429
+    if(nowT<oskyBackoffUntil){
+      res.writeHead(429,{'Content-Type':'application/json','Access-Control-Allow-Origin':'*','Retry-After':Math.ceil((oskyBackoffUntil-nowT)/1000)});
+      res.end(JSON.stringify({error:'rate limited, retry later',retryAfter:Math.ceil((oskyBackoffUntil-nowT)/1000)}));
+      return;
+    }
     const tk=await getToken();
     const h=tk?{'Authorization':'Bearer '+tk}:{};
     const url='https://opensky-network.org/api'+apiPath;
@@ -41,18 +156,61 @@ async function proxyOsky(apiPath,res){
     const body=await r.arrayBuffer();
     const buf=Buffer.from(body);
     log('<- '+r.status+' ('+buf.length+' bytes)','MSG');
-    res.writeHead(r.status,{'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+    // Record credit cost - OpenSky charges whether we get data or a 429
+    var cost=calcCreditCost(apiPath);
+    recordCredit(apiPath,cost);
+    // OpenSky sends authoritative remaining count in X-Rate-Limit-Remaining header.
+    // When we have it, it supersedes our estimate (which is a sanity-check fallback).
+    var rlRemain=r.headers.get('x-rate-limit-remaining');
+    if(rlRemain!==null&&rlRemain!==undefined){
+      var n=parseInt(rlRemain,10);
+      if(!isNaN(n))oskyRemainingFromHeader=n;
+    }
+    // OpenSky sends retry-after in seconds when rate-limited. Use it verbatim.
+    var rlRetry=r.headers.get('x-rate-limit-retry-after-seconds');
+    if(rlRetry!==null&&rlRetry!==undefined){
+      var retrySec=parseInt(rlRetry,10);
+      if(!isNaN(retrySec)&&retrySec>0)oskyRetryAfterUntil=nowT+(retrySec*1000);
+    }
+    // Track auth mode: authenticated calls have a token
+    oskyAuthMode = tk ? 'authenticated' : 'anonymous';
+    // 429 handling: enter backoff (use server-provided retry-after if given, else 60s)
+    if(r.status===429){
+      var backoffMs=oskyRetryAfterUntil>nowT?oskyRetryAfterUntil-nowT:60000;
+      oskyBackoffUntil=Math.max(oskyBackoffUntil,nowT+backoffMs);
+      oskyLast429=nowT;
+      log('[OSKY] 429 rate-limited — backoff '+Math.ceil(backoffMs/1000)+'s','WARN');
+      if(cached){
+        res.writeHead(cached.status,{'Content-Type':'application/json','Access-Control-Allow-Origin':'*','X-Cache':'STALE-429'});
+        res.end(cached.body);
+        return;
+      }
+    }
+    // Only cache successful responses so we don't serve error bodies repeatedly
+    if(r.status>=200&&r.status<300){
+      oskyCache[apiPath]={body:buf,status:r.status,ts:nowT};
+      oskyLastSuccess=nowT;
+    }
+    res.writeHead(r.status,{'Content-Type':'application/json','Access-Control-Allow-Origin':'*','X-Cache':'MISS','X-Credit-Cost':cost});
     res.end(buf);
   }catch(e){
     log('Proxy err: '+e.message,'ERR');
+    // On network error, serve cached data if we have it
+    var cached2=oskyCache[apiPath];
+    if(cached2){
+      res.writeHead(cached2.status,{'Content-Type':'application/json','Access-Control-Allow-Origin':'*','X-Cache':'STALE-ERR'});
+      res.end(cached2.body);
+      return;
+    }
     res.writeHead(502,{'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
     res.end(JSON.stringify({error:e.message}));
   }
 }
 
 // FlightAware AeroAPI
-const FA_KEY = 'hDZ46pJAZ1aif2ZRFaaIvWVww59ziFiv';
+const FA_KEY = process.env.FA_KEY || 'hDZ46pJAZ1aif2ZRFaaIvWVww59ziFiv';
 const FA_BASE = 'https://aeroapi.flightaware.com/aeroapi';
+if(!process.env.FA_KEY)console.warn('[SECURITY] FA_KEY not set in env - using bundled default. Set env var in production.');
 var faArrivals = [], faDepartures = [], faLastFetch = 0;
 // Persistent cache of all arrived aircraft (accumulates over time, survives refreshes)
 var groundCache = {}; // key: ident, value: arrival data
@@ -66,6 +224,17 @@ async function fetchFlightAware(){
     const r = await fetch(url,{headers:{'x-apikey':FA_KEY}});
     if(!r.ok){log('FA error: HTTP '+r.status,'ERR');return;}
     const d = await r.json();
+    // International airport detection — handles US FAA codes (C80, 29S, 0B1) correctly
+    // K*/P* = US ICAO. 3-char or digit-starting codes = US FAA. Other 4-char ICAO = international.
+    function isIntlCode(code){
+      if(!code)return false;
+      var c=String(code).toUpperCase();
+      if(c.length===4&&(c.charAt(0)==='K'||c.charAt(0)==='P'))return false;
+      if(c.length===3)return false;
+      if(c.length>=3&&c.charAt(0)>='0'&&c.charAt(0)<='9')return false;
+      if(c.length===4)return true;
+      return false;
+    }
     // Process arrivals
     var now=new Date().toISOString();
     if(d.arrivals){
@@ -73,7 +242,7 @@ async function fetchFlightAware(){
         var arrISO=f.actual_on||f.estimated_on||f.scheduled_on||'';
         var depISO=f.actual_off||f.estimated_off||f.scheduled_off||'';
         var orig=cleanCode(f,'origin');
-        var intl=orig&&orig.length>=2&&orig.charAt(0)!=='K'&&orig.charAt(0)!=='P';
+        var intl=isIntlCode(orig);
         var city=f.origin&&f.origin.city?f.origin.city:'';
         var tail=f.registration||'';
         var flightId=f.ident||'';
@@ -86,7 +255,7 @@ async function fetchFlightAware(){
         return{ident:displayIdent,callsign:displayCallsign,blocked:blocked,type:f.aircraft_type||'',from:orig||'',intl:intl,city:intl?'':city,country:intl?city:'',
         depart:fmtTime(depISO)||'',departISO:depISO,arrive:fmtTime(arrISO)||'',arriveISO:arrISO,
         progress:typeof f.progress_percent==='number'?f.progress_percent:(f.actual_on?100:(f.actual_off?50:0)),
-        arrived:!!f.actual_on,status:f.status||'',operator:getOperator(flightId)};
+        arrived:!!f.actual_on,status:f.status||'',operator:getOperator(flightId,tail)};
       });
     }
     if(d.scheduled_arrivals){
@@ -94,7 +263,7 @@ async function fetchFlightAware(){
         var arrISO=f.estimated_on||f.scheduled_on||'';
         var depISO=f.actual_off||f.estimated_off||f.scheduled_off||'';
         var orig=cleanCode(f,'origin');
-        var intl=orig&&orig.length>=2&&orig.charAt(0)!=='K'&&orig.charAt(0)!=='P';
+        var intl=isIntlCode(orig);
         var city=f.origin&&f.origin.city?f.origin.city:'';
         var tail=f.registration||'';var flightId=f.ident||'';
         var blocked=f.blocked||(!tail&&!flightId);
@@ -103,7 +272,7 @@ async function fetchFlightAware(){
         return{ident:displayIdent,callsign:displayCallsign,blocked:blocked,type:f.aircraft_type||'',from:orig||'',intl:intl,city:intl?'':city,country:intl?city:'',
         depart:fmtTime(depISO),departISO:depISO,arrive:fmtTime(arrISO),arriveISO:arrISO,
         progress:typeof f.progress_percent==='number'?f.progress_percent:(f.actual_on?100:(f.actual_off?50:0)),
-        arrived:false,status:f.status||'',operator:getOperator(flightId)};
+        arrived:false,status:f.status||'',operator:getOperator(flightId,tail)};
       });
       faArrivals=faArrivals.concat(sa);
     }
@@ -114,7 +283,7 @@ async function fetchFlightAware(){
         var depISO=f.actual_off||f.estimated_off||f.scheduled_off||'';
         var arrISO=f.actual_on||f.estimated_on||f.scheduled_on||'';
         var dest=cleanCode(f,'destination');
-        var intl=dest&&dest.length>=2&&dest.charAt(0)!=='K'&&dest.charAt(0)!=='P';
+        var intl=isIntlCode(dest);
         var city=f.destination&&f.destination.city?f.destination.city:'';
         var tail=f.registration||'';var flightId=f.ident||'';
         var blocked=f.blocked||(!tail&&!flightId);
@@ -123,7 +292,7 @@ async function fetchFlightAware(){
         return{ident:displayIdent,callsign:displayCallsign,blocked:blocked,type:f.aircraft_type||'',to:dest||'',intl:intl,city:intl?'':city,country:intl?city:'',
         depart:fmtTime(depISO),departISO:depISO,arrive:fmtTime(arrISO),arriveISO:arrISO,
         progress:typeof f.progress_percent==='number'?f.progress_percent:(f.actual_on?100:(f.actual_off?50:0)),
-        departed:!!f.actual_off,arrived:!!f.actual_on,status:f.status||'',operator:getOperator(flightId)};
+        departed:!!f.actual_off,arrived:!!f.actual_on,status:f.status||'',operator:getOperator(flightId,tail)};
       });
     }
     if(d.scheduled_departures){
@@ -131,7 +300,7 @@ async function fetchFlightAware(){
         var depISO=f.estimated_off||f.scheduled_off||'';
         var arrISO=f.estimated_on||f.scheduled_on||'';
         var dest=cleanCode(f,'destination');
-        var intl=dest&&dest.length>=2&&dest.charAt(0)!=='K'&&dest.charAt(0)!=='P';
+        var intl=isIntlCode(dest);
         var city=f.destination&&f.destination.city?f.destination.city:'';
         var tail=f.registration||'';var flightId=f.ident||'';
         var blocked=f.blocked||(!tail&&!flightId);
@@ -140,27 +309,28 @@ async function fetchFlightAware(){
         return{ident:displayIdent,callsign:displayCallsign,blocked:blocked,type:f.aircraft_type||'',to:dest||'',intl:intl,city:intl?'':city,country:intl?city:'',
         depart:fmtTime(depISO),departISO:depISO,arrive:fmtTime(arrISO),arriveISO:arrISO,
         progress:typeof f.progress_percent==='number'?f.progress_percent:(f.actual_on?100:(f.actual_off?50:0)),
-        departed:false,arrived:false,status:f.status||'',operator:getOperator(flightId)};
+        departed:false,arrived:false,status:f.status||'',operator:getOperator(flightId,tail)};
       });
       faDepartures=faDepartures.concat(sd);
     }
     faDepartures.sort(function(a,b){return(a.departISO||'').localeCompare(b.departISO||'');});
     // Filter out coast guard helicopters (C followed by 4+ digits)
-    function isCoastGuard(id){if(!id)return false;var u=id.toUpperCase();return u.charAt(0)==='C'&&u.length>=5&&u.charAt(1)>='0'&&u.charAt(1)<='9'&&u.charAt(2)>='0'&&u.charAt(2)<='9'&&u.charAt(3)>='0'&&u.charAt(3)<='9'&&u.charAt(4)>='0'&&u.charAt(4)<='9';}
+    function isCoastGuard(id){if(!id)return false;var u=String(id).toUpperCase();return u.charAt(0)==='C'&&u.length>=5&&u.charAt(1)>='0'&&u.charAt(1)<='9'&&u.charAt(2)>='0'&&u.charAt(2)<='9'&&u.charAt(3)>='0'&&u.charAt(3)<='9'&&u.charAt(4)>='0'&&u.charAt(4)<='9';}
     faArrivals=faArrivals.filter(function(f){return !isCoastGuard(f.ident);});
     faDepartures=faDepartures.filter(function(f){return !isCoastGuard(f.ident);});
     // Accumulate arrived aircraft into groundCache
     for(var i=0;i<faArrivals.length;i++){
       var f=faArrivals[i];
       if(f.arrived&&f.ident&&f.ident!=='BLOCKED'){
-        groundCache[f.ident.toUpperCase()]={ident:f.ident,callsign:f.callsign,type:f.type,from:f.from,city:f.city,country:f.country,intl:f.intl,
+        var idKey=String(f.ident).toUpperCase();
+        groundCache[idKey]={ident:f.ident,callsign:f.callsign,type:f.type,from:f.from,city:f.city,country:f.country,intl:f.intl,
           arrivedTime:f.arrive,arrivedISO:f.arriveISO,departISO:f.departISO};
       }
     }
     // Remove aircraft that have departed from groundCache
     for(var i=0;i<faDepartures.length;i++){
       var f=faDepartures[i];
-      if(f.departed&&f.ident){delete groundCache[f.ident.toUpperCase()];}
+      if(f.departed&&f.ident){delete groundCache[String(f.ident).toUpperCase()];}
     }
     // Expire entries older than 30 days
     var thirtyDaysAgo=Date.now()-(30*24*60*60*1000);
@@ -172,10 +342,40 @@ async function fetchFlightAware(){
 }
 
 
-function getOperator(ident){
-  if(!ident)return'';
-  var pfx=ident.replace(/[0-9]/g,'').toUpperCase();
-  var OPS={EJA:'NetJets',LXJ:'Flexjet',VJT:'VistaJet',NJE:'NetJets EU',XOJ:'XO',KOW:'Wheels Up',TWY:'Solairus',JRE:'JetEdge',ASP:'Jet Access',CLY:'Clay Lacy',RKK:'K2 Aviation',BBJ:'Boeing BBJ',GAJ:'Gulfstream',SLR:'Solaris',FLX:'Flexjet',MMD:'Priester',GCK:'Jet Linx',LNX:'Lynx Air',NJT:'NetJets',VCG:'VistaJet',SIO:'Sirio',SVW:'VistaJet',PEX:'PlaneSense',TCJ:'Jet Aviation',JFA:'Jetfly',AOJ:'ASL',IJM:'VistaJet',TRS:'TriStar',SCX:'Sun Country',FLG:'Flagler',BBB:'Air Hamburg',SXN:'Saxon',HYP:'Titan Airways',NJB:'NetJets',FYL:'Jetfly',GAF:'German AF',XJT:'XO',LPZ:'Luxair'};
+// Detect the operator (fractional / charter brand) for a flight. Strategy:
+//   1. Tail suffix tells us who OWNS the airframe — most reliable for FBO purposes since
+//      the airframe owner is who the FBO services (fuel bill, catering, parking).
+//      Example: N519FX is Flexjet-owned, even if the current flight uses a Wheels Up callsign.
+//   2. If no tail-suffix match, fall back to the flight ID prefix (callsign-based).
+//      Example: KOW519 → Wheels Up, EJA260 → NetJets.
+// FBO ramp staff care about WHO they're servicing — that's the airframe owner, not the
+// callsign-of-the-day.
+function getOperator(flightId, tail){
+  // Tail suffix detection — operator's branding code that they put on their N-number.
+  // Pattern: trailing letters of the N-number registration.
+  if(tail){
+    var t=tail.toUpperCase().replace(/[^A-Z0-9]/g,'');
+    // Strip the leading N and any digits to get the suffix
+    var suffix=t.replace(/^N/,'').replace(/^[0-9]+/,'');
+    var SUFFIX={
+      'FX':'Flexjet',     // Flexjet uses N###FX
+      'XJ':'Flexjet',     // Flexjet variant N###XJ
+      'QS':'NetJets',     // NetJets uses N###QS (QuebecSierra)
+      'VA':'VistaJet',    // VistaJet uses N###VA
+      'VJ':'VistaJet',    // VistaJet variant
+      'UP':'Wheels Up',   // Wheels Up uses N###UP
+      'WU':'Wheels Up'    // Wheels Up variant
+    };
+    if(SUFFIX[suffix])return SUFFIX[suffix];
+  }
+  // Fall back to flight ID prefix (callsign-based detection)
+  if(!flightId)return '';
+  var pfx=flightId.replace(/[0-9]/g,'').toUpperCase();
+  // KOW is Baker Aviation (Fort Worth TX, callsign "RODEO") — NOT Wheels Up. Wheels Up's
+  // actual ICAO code is WUP (callsign "JET"). The earlier `KOW: 'Wheels Up'` mapping was wrong.
+  // EJM (Executive Jet Management) uses callsign "JetSpeed" — NetJets' charter/management sister.
+  // XSR is Airshare (Executive Flight Services LLC dba Airshare, callsign "AIRSHARE").
+  var OPS={EJA:'NetJets',LXJ:'Flexjet',VJT:'VistaJet',NJE:'NetJets EU',XOJ:'XO',KOW:'Baker Aviation',WUP:'Wheels Up',TWY:'Solairus',JRE:'JetEdge',ASP:'Jet Access',CLY:'Clay Lacy',RKK:'K2 Aviation',BBJ:'Boeing BBJ',GAJ:'Gulfstream',SLR:'Solaris',FLX:'Flexjet',MMD:'Priester',GCK:'Jet Linx',LNX:'Lynx Air',NJT:'NetJets',VCG:'VistaJet',SIO:'Sirio',SVW:'VistaJet',PEX:'PlaneSense',TCJ:'Jet Aviation',JFA:'Jetfly',AOJ:'ASL',IJM:'VistaJet',TRS:'TriStar',SCX:'Sun Country',FLG:'Flagler',BBB:'Air Hamburg',SXN:'Saxon',HYP:'Titan Airways',NJB:'NetJets',FYL:'Jetfly',GAF:'German AF',XJT:'XO',LPZ:'Luxair',EJM:'EJM',XSR:'Airshare'};
   return OPS[pfx]||'';
 }
 
@@ -213,6 +413,11 @@ const server = http.createServer(async(req,res)=>{
     res.end(fs.readFileSync(htmlPath));return;
   }
   if(req.url.startsWith('/osky/')){await proxyOsky(req.url.replace('/osky',''),res);return;}
+  if(req.url==='/status'){
+    // Diagnostic endpoint - shows credit usage, backoff state, auth mode
+    res.writeHead(200,{'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+    res.end(JSON.stringify(getCreditSummary()));return;
+  }
   if(req.url==='/fa/arrivals'){
     res.writeHead(200,{'Content-Type':'application/json'});
     res.end(JSON.stringify(faArrivals));return;
@@ -232,6 +437,89 @@ const server = http.createServer(async(req,res)=>{
     var dbg=faArrivals.slice(0,5).map(function(f){return{ident:f.ident,departISO:f.departISO,arriveISO:f.arriveISO,arrived:f.arrived,depart:f.depart,arrive:f.arrive,type:f.type};});
     res.writeHead(200,{'Content-Type':'application/json'});
     res.end(JSON.stringify(dbg,null,2));return;
+  }
+  // Manual tail number lookup: fetches aircraft info + recent flight history
+  if(req.url.startsWith('/fa/lookup')){
+    try{
+      var uq=url.parse(req.url,true).query;
+      var ident=(uq.ident||'').trim().toUpperCase();
+      if(!ident){res.writeHead(400);res.end(JSON.stringify({error:'missing ident'}));return;}
+      // Input validation: reject anything that's not a valid aircraft identifier format
+      // Aircraft registrations/callsigns are alphanumeric with optional dashes, 2-10 chars
+      if(ident.length<2||ident.length>10||!/^[A-Z0-9-]+$/.test(ident)){
+        res.writeHead(400);res.end(JSON.stringify({error:'invalid ident format'}));return;
+      }
+      // Simple per-IP rate limit: max 30 lookups per minute
+      var clientIP=req.socket.remoteAddress||'unknown';
+      if(!global._lookupRate)global._lookupRate={};
+      var nowT=Date.now();
+      var rec=global._lookupRate[clientIP]||{count:0,resetAt:nowT+60000};
+      if(nowT>rec.resetAt){rec={count:0,resetAt:nowT+60000};}
+      rec.count++;
+      global._lookupRate[clientIP]=rec;
+      if(rec.count>30){res.writeHead(429);res.end(JSON.stringify({error:'rate limit: max 30 lookups/min'}));return;}
+      var out={ident:ident,type:null,model:null,owner:null,flights:[],lastArrival:null,nextDeparture:null};
+      // Step 1: aircraft type info
+      var acInfoURL=FA_BASE+'/aircraft/'+encodeURIComponent(ident)+'/owner';
+      var acTypeURL=FA_BASE+'/aircraft/'+encodeURIComponent(ident);
+      try{
+        var rAc=await fetch(acTypeURL,{headers:{'x-apikey':FA_KEY}});
+        if(rAc.ok){
+          var dAc=await rAc.json();
+          if(dAc){
+            out.type=dAc.type||null;
+            out.model=dAc.type_name||dAc.description||null;
+            out.engineType=dAc.engine_type||null;
+            out.engineCount=dAc.engine_count||null;
+          }
+        }
+      }catch(e){log('FA type lookup failed: '+e.message,'ERR');}
+      // Step 2: recent flights
+      var fURL=FA_BASE+'/flights/'+encodeURIComponent(ident)+'?max_pages=1';
+      try{
+        var rF=await fetch(fURL,{headers:{'x-apikey':FA_KEY}});
+        if(rF.ok){
+          var dF=await rF.json();
+          if(dF&&dF.flights){
+            var flights=dF.flights.slice(0,10).map(function(f){
+              return {
+                ident:f.ident,
+                fa_flight_id:f.fa_flight_id,
+                origin:f.origin?(f.origin.code||f.origin.code_iata||''):'',
+                originCity:f.origin?f.origin.city||'':'',
+                destination:f.destination?(f.destination.code||f.destination.code_iata||''):'',
+                destinationCity:f.destination?f.destination.city||'':'',
+                scheduled_out:f.scheduled_out,
+                actual_out:f.actual_out,
+                scheduled_in:f.scheduled_in,
+                estimated_in:f.estimated_in,
+                actual_in:f.actual_in,
+                status:f.status,
+                aircraft_type:f.aircraft_type,
+                progress_percent:f.progress_percent
+              };
+            });
+            out.flights=flights;
+            // Find last arrival at KSFO and next departure from KSFO
+            for(var fi=0;fi<flights.length;fi++){
+              var fl=flights[fi];
+              if(!out.lastArrival&&fl.destination==='KSFO'&&fl.actual_in){
+                out.lastArrival=fl;
+              }
+              if(!out.nextDeparture&&fl.origin==='KSFO'&&!fl.actual_out&&fl.scheduled_out){
+                out.nextDeparture=fl;
+              }
+            }
+            if(!out.type&&flights.length>0&&flights[0].aircraft_type)out.type=flights[0].aircraft_type;
+          }
+        }
+      }catch(e){log('FA flights lookup failed: '+e.message,'ERR');}
+      res.writeHead(200,{'Content-Type':'application/json'});
+      res.end(JSON.stringify(out));return;
+    }catch(e){
+      res.writeHead(500,{'Content-Type':'application/json'});
+      res.end(JSON.stringify({error:e.message}));return;
+    }
   }
   if(req.url==='/fa/ground'){
     // Use groundCache which accumulates all arrived aircraft and removes departed ones
@@ -347,11 +635,25 @@ function xval(xml){
 
 function broadcast(d){var m=JSON.stringify(d);wsClients.forEach(function(c){if(c.readyState===1)try{c.send(m);}catch(e){}});}
 
-connectSWIM();
+// SWIM disabled in v220 — the parsed arrival/departure messages were not consumed by any UI.
+// Set env var ENABLE_SWIM=1 to turn the feed back on (you'll still need to wire a consumer).
+if(process.env.ENABLE_SWIM==='1'){
+  log('SWIM enabled via ENABLE_SWIM=1','OK');
+  connectSWIM();
+} else {
+  log('SWIM disabled (set ENABLE_SWIM=1 to enable). Data not currently consumed by UI.','INFO');
+}
 
 console.log(`\n  Skyway v4 — http://localhost:${PORT}\n`);
 getToken();
 process.on('SIGINT',()=>{log('Bye','WARN');process.exit(0);});
+// Enterprise-grade server robustness: never crash the whole process on a single unhandled error
+process.on('uncaughtException',function(err){
+  log('[UNCAUGHT] '+err.message+(err.stack?'\n'+err.stack:''),'ERR');
+});
+process.on('unhandledRejection',function(reason){
+  log('[UNHANDLED PROMISE] '+(reason&&reason.message?reason.message:reason),'ERR');
+});
 
 // ═══════════════════════════════════════
 // HTML BUILDER — writes a real .html file
@@ -361,7 +663,7 @@ return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Skyway</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
@@ -370,7 +672,12 @@ return `<!DOCTYPE html>
 :root{--b0:#e8eaed;--b1:#f0f1f3;--b2:#d9dce1;--b3:#c8ccd3;--bd:#b8bcc5;--t1:#1c1f26;--t2:#3d4352;--t3:#7a8194;--blue:#2563eb;--cyan:#0891b2;--green:#16a34a;--amber:#d97706;--red:#dc2626;--violet:#7c3aed;--mono:'JetBrains Mono',ui-monospace,monospace;--sans:'Inter','Outfit',system-ui,sans-serif}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:var(--sans);background:var(--b0);color:var(--t1);min-height:100vh;-webkit-font-smoothing:antialiased}
-.topbar{display:flex;align-items:center;justify-content:space-between;padding:0 24px;height:54px;background:linear-gradient(180deg,#2c3040,#1e222e);border-bottom:1px solid rgba(255,255,255,.06);position:sticky;top:0;z-index:100;box-shadow:0 2px 8px rgba(0,0,0,.15)}
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:0 24px;padding-top:env(safe-area-inset-top);padding-left:max(24px,env(safe-area-inset-left));padding-right:max(24px,env(safe-area-inset-right));height:54px;background:linear-gradient(180deg,#2c3040,#1e222e);border-bottom:1px solid rgba(255,255,255,.06);position:sticky;top:0;z-index:100;box-shadow:0 2px 8px rgba(0,0,0,.15)}
+/* On notched/Dynamic-Island iPhones the height grows by the safe-area inset.
+   Use a clamp so the visual chrome stays the same — the inset just adds breathing room. */
+@supports(padding:env(safe-area-inset-top)){
+  .topbar{height:auto;min-height:54px;box-sizing:border-box}
+}
 .tb-l{display:flex;align-items:center;gap:16px}
 .brand{display:flex;align-items:center;gap:8px}
 .brand-i{width:28px;height:28px;border-radius:6px;background:linear-gradient(135deg,#3b82f6,#60a5fa);display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:800;color:#1a1f2e}
@@ -381,6 +688,13 @@ body{font-family:var(--sans);background:var(--b0);color:var(--t1);min-height:100
 .pill.live .dot{width:6px;height:6px;border-radius:50%;background:#4ade80;animation:bk 2s infinite}
 .pill.err{color:#f87171;background:rgba(248,113,113,.1)}
 @keyframes bk{0%,100%{opacity:1}50%{opacity:.2}}
+@keyframes takeoffPulse{
+  0%,100%{background:linear-gradient(90deg,rgba(34,197,94,.18),rgba(34,197,94,.05));box-shadow:inset 3px 0 0 #22c55e,0 0 8px rgba(34,197,94,.3)}
+  50%{background:linear-gradient(90deg,rgba(34,197,94,.35),rgba(34,197,94,.12));box-shadow:inset 3px 0 0 #16a34a,0 0 14px rgba(34,197,94,.55)}
+}
+.fr.takeoff-flash{animation:takeoffPulse 1.2s ease-in-out infinite;position:relative}
+/* DEPARTED indicator now lives inline in the ETA cell (.dep-eta) — no separate badge needed */
+.fi.zp{position:relative}
 .ga{font-family:var(--mono);font-size:9px;font-weight:700;color:#8ba3c4;padding:3px 8px;border-radius:8px;background:rgba(139,163,196,.08);border:1px solid rgba(139,163,196,.15)}
 .tb-c{display:flex;align-items:center;gap:10px}
 .apt{font-family:var(--mono);font-size:15px;font-weight:800;color:#b4c4d8}
@@ -394,16 +708,19 @@ body{font-family:var(--sans);background:var(--b0);color:var(--t1);min-height:100
 .ib{width:30px;height:30px;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:6px;cursor:pointer;color:rgba(255,255,255,.5);font-size:13px;transition:all .15s}
 .ib:hover{border-color:rgba(232,212,139,.4);color:#b4c4d8}
 .map-row{display:flex;gap:10px;margin:10px 12px;height:260px;min-height:260px;flex-shrink:0}
-.map-area{position:relative;flex:2.5;border-radius:10px;border:1px solid var(--bd);overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.04),0 4px 12px rgba(0,0,0,.02)}
-#map{width:100%;height:100%;background:var(--b0)}
+.map-area{position:relative;flex:2.5;border-radius:10px;border:1px solid var(--bd);overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.04),0 4px 12px rgba(0,0,0,.02);isolation:isolate;contain:layout paint}
+#map{width:100%;height:100%;background:#0b1d2a;position:relative;overflow:hidden;contain:strict}
+.leaflet-container{overflow:hidden!important;position:relative!important;contain:layout paint}
+.leaflet-pane,.leaflet-marker-pane,.leaflet-overlay-pane{contain:layout style}
 .chart-area{flex:1;border-radius:10px;border:1px solid var(--bd);background:var(--b1);padding:12px 14px;display:flex;flex-direction:column;box-shadow:0 1px 3px rgba(0,0,0,.04),0 4px 12px rgba(0,0,0,.02)}
 .leaflet-tile-pane{filter:saturate(.5) brightness(1.02) contrast(1.02)}
 .leaflet-control-zoom a{background:var(--b1)!important;color:var(--t1)!important;border-color:var(--bd)!important;font-weight:700!important}
 .leaflet-control-attribution{display:none!important}
 .ac-tip{background:rgba(255,255,255,.92)!important;border:1px solid rgba(0,0,0,.08)!important;border-radius:4px!important;padding:2px 5px!important;font-family:'JetBrains Mono',monospace!important;font-size:9px!important;font-weight:700!important;color:#111827!important;box-shadow:0 1px 4px rgba(0,0,0,.08)!important;white-space:nowrap!important}
 .ac-tip:before{display:none!important}
-.hud{position:absolute;top:8px;left:8px;z-index:500;display:flex;gap:1px;background:var(--bd);border-radius:8px;overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,.06)}
-.hc{display:flex;flex-direction:column;align-items:center;padding:5px 10px;background:rgba(255,255,255,.95);backdrop-filter:blur(16px);min-width:48px}
+.hud{position:absolute;top:8px;left:8px;z-index:500;display:flex;gap:0;background:rgba(255,255,255,.95);backdrop-filter:blur(16px);border-radius:10px;overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,.08);border:1px solid rgba(0,0,0,.05)}
+.hc{display:flex;flex-direction:column;align-items:center;padding:5px 10px;background:transparent;min-width:48px;border-right:1px solid rgba(0,0,0,.06)}
+.hc:last-child{border-right:none}
 .hc .v{font-family:var(--mono);font-size:14px;font-weight:800;line-height:1}
 .hc .l{font-family:var(--mono);font-size:6px;color:var(--t3);text-transform:uppercase;letter-spacing:.6px;margin-top:2px;font-weight:600}
 .hc.b .v{color:var(--blue)}.hc.g .v{color:var(--green)}.hc.a .v{color:var(--amber)}.hc.c .v{color:var(--cyan)}.hc.r .v{color:var(--red)}
@@ -414,17 +731,32 @@ body{font-family:var(--sans);background:var(--b0);color:var(--t1);min-height:100
 .bt{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:1.2px}
 .bt.ar{color:var(--blue)}.bt.de{color:var(--red)}
 .bc{font-family:var(--mono);font-size:11px;font-weight:700;color:var(--t3)}
-.cols{display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr .7fr .7fr .5fr;gap:6px;padding:7px 12px;font-family:var(--mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--t3);border-bottom:1px solid var(--bd);text-align:center;background:var(--b2)}
-.cols.ca-done{display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr .8fr .7fr;gap:6px;padding:7px 12px;font-family:var(--mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--t3);border-bottom:1px solid var(--bd);text-align:center;background:var(--b2)}
-.cols.cd-done{display:grid;grid-template-columns:1fr 1fr 1fr 1fr .8fr .7fr;gap:6px;padding:7px 12px;font-family:var(--mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--t3);border-bottom:1px solid var(--bd);text-align:center;background:var(--b2)}
-.cols.ca{grid-template-columns:1fr 1fr 1fr 1fr 1fr .7fr .7fr .5fr}
-.cols.cd{grid-template-columns:1fr 1fr 1fr 1fr .7fr .7fr .4fr .4fr .4fr .4fr .4fr}
+/* Column system. Two patterns: content columns use fr units (flex-share of remaining space);
+   icon columns (OP, STATUS) use fixed pixel widths because they hold same-size pills regardless
+   of how wide the table is. fr-sized pill columns get visually huge on wide screens for no
+   reason (an "NJ" pill doesn't need 80px). */
+.cols{display:grid;grid-template-columns:1.1fr 28px 56px 1.05fr 1.05fr .95fr .95fr .8fr .8fr .55fr;gap:5px;padding:7px 12px;font-family:var(--mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--t3);border-bottom:1px solid var(--bd);text-align:center;background:var(--b2)}
+.cols.ca-done{display:grid;grid-template-columns:1.1fr 28px 56px 1.05fr 1.05fr .95fr .95fr .85fr .8fr;gap:5px;padding:7px 12px;font-family:var(--mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--t3);border-bottom:1px solid var(--bd);text-align:center;background:var(--b2)}
+.cols.cd-done{display:grid;grid-template-columns:1.1fr 28px 56px 1.05fr 1.05fr .95fr .85fr .8fr;gap:5px;padding:7px 12px;font-family:var(--mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--t3);border-bottom:1px solid var(--bd);text-align:center;background:var(--b2)}
+.cols.ca{grid-template-columns:1.1fr 28px 56px 1.05fr 1.05fr .95fr .95fr .8fr .8fr .55fr}
+.cols.cd{grid-template-columns:1.1fr 28px 56px 1.05fr 1.05fr .95fr .8fr .8fr}
 .cols span:first-child{text-align:left;padding-left:16px}
 .bb{flex:1;padding:5px 8px}
-.fr{display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr .7fr .7fr .5fr;gap:6px;align-items:center;padding:7px 8px;background:var(--b1);border:1px solid var(--bd);border-radius:7px;margin-bottom:3px;cursor:pointer;transition:all .12s;box-shadow:0 1px 2px rgba(0,0,0,.02)}
-.fr.arr-done{grid-template-columns:1fr 1fr 1fr 1fr 1fr .8fr .7fr}
-.fr.dep{grid-template-columns:1fr 1fr 1fr 1fr .7fr .7fr .4fr .4fr .4fr .4fr .4fr}
-.fr.dep-simple{grid-template-columns:1fr 1fr 1fr 1fr .8fr .7fr}
+.fr{display:grid;grid-template-columns:1.1fr 28px 56px 1.05fr 1.05fr .95fr .95fr .8fr .8fr .55fr;gap:5px;align-items:center;padding:7px 8px;background:var(--b1);border:1px solid var(--bd);border-radius:7px;margin-bottom:3px;cursor:pointer;transition:all .12s;box-shadow:0 1px 2px rgba(0,0,0,.02)}
+.fr > *{min-width:0;overflow:hidden}
+/* .fr > .fi keeps overflow:hidden from the parent rule above — badges wrap inside the cell */
+.fr.arr-done{grid-template-columns:1.1fr 28px 56px 1.05fr 1.05fr .95fr .95fr .85fr .8fr}
+.fr.dep{grid-template-columns:1.1fr 28px 56px 1.05fr 1.05fr .95fr .8fr .8fr}
+.fr.dep-simple{grid-template-columns:1.1fr 28px 56px 1.05fr 1.05fr .95fr .85fr .8fr}
+/* OP column cell: holds the operator brand pill (NJ/FX/BA/etc), centered, no overflow.
+   Empty cells render as a clean gap rather than collapsing the column. */
+.fr > .fop{display:flex;align-items:center;justify-content:center;overflow:visible}
+.fr > .fop > span{margin:0 !important}
+/* STATUS column cell: holds QT, MED (medical cross), VIP badges in a horizontal row.
+   Each row has 0–3 badges; the cell flows them with small gaps. Strip per-badge left-margin
+   so badges don't drift right when they're in this dedicated cell. */
+.fr > .fst{display:flex;align-items:center;justify-content:center;gap:3px;overflow:visible;flex-wrap:wrap}
+.fr > .fst > span{margin:0 !important}
 .fr:hover{background:var(--b2);border-color:var(--bd)}
 .fr.done{opacity:1}
 .fr.arr-active{background:rgba(37,99,235,.03);border-color:rgba(37,99,235,.12)}
@@ -432,24 +764,27 @@ body{font-family:var(--sans);background:var(--b0);color:var(--t1);min-height:100
 .fr.dep-ground{background:rgba(220,38,38,.02);border-color:rgba(220,38,38,.1)}
 .fr.dep-gone{background:rgba(220,38,38,.04);border-color:rgba(220,38,38,.12)}
 .chk{width:16px;height:16px;accent-color:var(--green);cursor:pointer;margin:0 auto;display:block}
-.fi{font-family:var(--mono);font-weight:800;font-size:17px;color:var(--cyan);overflow:visible;text-overflow:ellipsis;white-space:nowrap;line-height:1.2;position:relative;padding-left:16px}
-.fi
-#map .leaflet-tile-pane{filter:invert(1) hue-rotate(180deg) brightness(0.6) contrast(1.2) saturate(0.3)}
+.fi{font-family:var(--mono);font-weight:800;font-size:17px;color:var(--cyan);line-height:1.2;position:relative;padding-left:16px;min-width:0;overflow:hidden;text-overflow:clip;display:flex;flex-wrap:wrap;align-items:baseline;column-gap:4px;row-gap:2px}
+.fi>*{flex-shrink:0}
+
 .spot-dd{z-index:10000;background:var(--b1);border:1px solid var(--bd);border-radius:4px;box-shadow:0 4px 12px rgba(0,0,0,.3);padding:4px 0;overflow-y:auto;min-width:140px}
 .spot-dd-item{font-family:var(--mono);font-size:9px;padding:3px 10px;cursor:pointer;color:var(--t1);white-space:nowrap}
 .spot-dd-item:hover{background:var(--blue);color:#fff}
 .spot-dd-item:first-child{color:#ef4444;border-bottom:1px solid var(--bd);font-weight:700}
 .spot-dd-item:first-child:hover{background:#ef4444;color:#fff}
+.map-tb-btn{font-family:var(--mono);font-size:16px;font-weight:700;color:#fff;border:1px solid;border-radius:6px;padding:6px 9px;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.2);transition:transform .1s,box-shadow .15s;line-height:1;min-width:32px}
+.map-tb-btn:hover{transform:translateX(2px);box-shadow:0 3px 8px rgba(0,0,0,.25)}
+.map-tb-btn:active{transform:translateX(0)}
 .zp{cursor:pointer}.fi.zp:hover{color:var(--blue);text-decoration:underline}
-.fi .sub{font-size:9px;font-weight:500;color:var(--t3);display:block}
-.ft{font-family:var(--mono);font-size:16px;font-weight:700;color:var(--t1);text-align:center;line-height:1.2}
+.fi .sub{font-size:9px;font-weight:500;color:var(--t3);flex-basis:100%;width:100%;line-height:1.2}
+.ft{font-family:var(--mono);font-size:16px;font-weight:700;color:var(--t1);text-align:center;line-height:1.2;display:flex;flex-direction:column;justify-content:center;align-items:center;min-width:0;overflow:hidden}
 .ft .sub{font-size:8px;font-weight:500;color:var(--t3);display:block}
-.ff{font-family:var(--mono);font-size:14px;font-weight:600;color:var(--t2);text-align:center;line-height:1.2}
+.ff{font-family:var(--mono);font-size:14px;font-weight:600;color:var(--t2);text-align:center;line-height:1.2;display:flex;flex-direction:column;justify-content:center;align-items:center;min-width:0;overflow:hidden}
 .ff.intl{color:var(--red);font-weight:700}
 .ff .sub{font-size:8px;font-weight:400;color:var(--t3);display:block}
 .ff.intl .sub{color:var(--red);font-weight:500;opacity:.7;font-size:8px}
-.fm{font-family:var(--mono);font-size:13px;font-weight:600;color:var(--t2);text-align:center}
-.fe{font-family:var(--mono);font-size:13px;font-weight:700;text-align:center}
+.fm{font-family:var(--mono);font-size:13px;font-weight:600;color:var(--t2);text-align:center;display:flex;flex-direction:column;justify-content:center;align-items:center;min-width:0;overflow:hidden}
+.fe{font-family:var(--mono);font-size:13px;font-weight:700;text-align:center;display:flex;flex-direction:column;justify-content:center;align-items:center;min-width:0;overflow:hidden}
 .fe.soon{color:var(--green)}.fe.mid{color:var(--amber)}.fe.far{color:var(--t3)}
 .done-hdr{border-top:2px solid var(--bd)}
 .prog{display:flex;align-items:center;padding:0 2px;width:100%;min-width:20px;min-height:6px}
@@ -469,17 +804,137 @@ body{font-family:var(--sans);background:var(--b0);color:var(--t1);min-height:100
 .bb .fr:nth-child(even){background:rgba(0,0,0,.02)}
 .bb .fr:nth-child(odd){background:var(--b1)}
 
-#map .leaflet-tile-pane{filter:invert(1) hue-rotate(180deg) brightness(0.6) contrast(1.2) saturate(0.3)}
+
 .spot-dd{z-index:10000;background:var(--b1);border:1px solid var(--bd);border-radius:4px;box-shadow:0 4px 12px rgba(0,0,0,.3);padding:4px 0;overflow-y:auto;min-width:140px}
 .spot-dd-item{font-family:var(--mono);font-size:9px;padding:3px 10px;cursor:pointer;color:var(--t1);white-space:nowrap}
 .spot-dd-item:hover{background:var(--blue);color:#fff}
 .spot-dd-item:first-child{color:#ef4444;border-bottom:1px solid var(--bd);font-weight:700}
 .spot-dd-item:first-child:hover{background:#ef4444;color:#fff}
+.map-tb-btn{font-family:var(--mono);font-size:16px;font-weight:700;color:#fff;border:1px solid;border-radius:6px;padding:6px 9px;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.2);transition:transform .1s,box-shadow .15s;line-height:1;min-width:32px}
+.map-tb-btn:hover{transform:translateX(2px);box-shadow:0 3px 8px rgba(0,0,0,.25)}
+.map-tb-btn:active{transform:translateX(0)}
 .zp{cursor:pointer;transition:color .15s}.zp:hover{color:var(--blue)!important;text-decoration:underline}
 .leaflet-popup-content-wrapper{background:rgba(15,23,42,.85)!important;color:#e2e8f0!important;border-radius:6px!important;box-shadow:0 2px 8px rgba(0,0,0,.4)!important;font-size:9px!important;padding:0!important}
 .leaflet-popup-content{margin:6px 8px!important;color:#e2e8f0!important}
 .leaflet-popup-tip{background:rgba(15,23,42,.85)!important}
 img.emoji{height:1em;width:1em;margin:0 .05em 0 .1em;vertical-align:-0.1em;display:inline-block}
+
+@media print {
+  body > *:not(#shift-overlay){display:none!important}
+  #shift-overlay{position:static!important;background:#fff!important;padding:0!important;overflow:visible!important}
+  #shift-overlay > div{box-shadow:none!important;max-width:100%!important}
+  #shift-overlay button{display:none!important}
+  @page{margin:0.5in;size:letter}
+}
+/* MOBILE RESPONSIVE */
+@media (max-width: 900px){
+  .topbar{flex-wrap:wrap;height:auto;padding:8px 12px;gap:6px}
+  .tb-l,.tb-c,.tb-r{gap:6px}
+  .tb-c{order:2;width:100%;justify-content:center;border-top:1px solid rgba(255,255,255,.08);padding-top:6px;margin-top:4px}
+  .tb-r{order:3;gap:4px;flex-wrap:wrap;justify-content:center}
+  .brand-n{font-size:14px}
+  .sep{display:none}
+  .tb-l span[style*="letter-spacing:3px"]{font-size:11px!important;letter-spacing:1px!important}
+  .clk{font-size:10px}
+  .apt{font-size:16px}
+  .apn{font-size:10px}
+  .fd{font-size:8px;padding:2px 5px}
+  .ib{width:26px;height:26px;font-size:11px}
+  .map-row{flex-direction:column;height:auto;min-height:auto;margin:8px}
+  #map{height:260px;min-height:260px;width:100%!important}
+  .chart-area{width:100%;min-height:140px}
+  .hud{flex-wrap:wrap;max-width:calc(100% - 16px)}
+  .hc{padding:4px 8px;min-width:42px;font-size:10px}
+  .hc .v{font-size:13px}
+  .hc .l{font-size:8px}
+  .boards{grid-template-columns:1fr;gap:2px}
+  .board{border-top:2px solid var(--bd)}
+  .bh{padding:8px 10px}
+  .bt{font-size:11px}
+  .bc{font-size:14px}
+  /* Mobile: same OP=24px / STATUS=44px fixed-width strategy. Slightly smaller than desktop
+     because mobile pills also shrink with the smaller font-size. Tight 2px gap so columns
+     don't pull apart on a phone screen. */
+  .cols.ca,.cols.cd{font-size:7.5px;padding:6px 6px;gap:2px;grid-template-columns:1.1fr 24px 44px .7fr .7fr .55fr .55fr .5fr .7fr .4fr!important}
+  .cols.cd{grid-template-columns:1.1fr 24px 44px .7fr .7fr .55fr .5fr .7fr!important}
+  .cols.ca-done{grid-template-columns:1.1fr 24px 44px .7fr .7fr .55fr .55fr .5fr .7fr!important}
+  .cols.cd-done{grid-template-columns:1.1fr 24px 44px .7fr .7fr .55fr .5fr .7fr!important}
+  .fr{font-size:10px!important;padding:6px 6px!important;gap:2px!important}
+  .fr.ar{grid-template-columns:1.1fr 24px 44px .7fr .7fr .55fr .55fr .5fr .7fr .4fr!important}
+  .fr.arr-done{grid-template-columns:1.1fr 24px 44px .7fr .7fr .55fr .55fr .5fr .7fr!important}
+  .fr.dep,.fr.dep-ground,.fr.dep-gone{grid-template-columns:1.1fr 24px 44px .7fr .7fr .55fr .5fr .7fr!important}
+  .fr.dep-simple{grid-template-columns:1.1fr 24px 44px .7fr .7fr .55fr .5fr .7fr!important}
+  .fi{font-size:11px!important}
+  .ft{font-size:9px!important}
+  .ff{font-size:9px!important}
+  .fm{font-size:9px!important}
+  .fe{font-size:10px!important}
+  .sub{font-size:8px!important}
+  .pax{width:100%;font-size:9px;padding:2px}
+  .chk{transform:scale(0.8)}
+  .spot-click{font-size:8px!important}
+  .spot-dd{font-size:9px;max-width:160px}
+  .spot-dd-item{padding:4px 8px}
+}
+@media (max-width: 500px){
+  .topbar{padding:6px 8px}
+  .brand-n{font-size:13px}
+  .tb-l span[style*="letter-spacing:3px"]{display:none}
+  .cols.ca span,.cols.cd span,.cols.ca-done span,.cols.cd-done span{font-size:7px}
+  .fr{font-size:9px!important}
+  .fi{font-size:10px!important}
+  /* iPhone fixes (mostly < 430px viewports — iPhone SE through 15 Pro Max all land here):
+     - Tighten the IDENT cell's left padding so the tail number isn't pushed off-screen
+     - Allow the OP/STATUS pill cells to overflow visibly so a pill is never clipped
+     - Shrink status pills (GPU/MED/VIP) one size down so all three fit when stacked
+     - Reduce the OP column to 22px (single 2-letter pill always fits at 8px font)
+     - Reduce STATUS column to 40px (3 small pills fit when font is shrunk) */
+  .cols span:first-child,.fi{padding-left:6px!important}
+  .fr > .fop,.fr > .fst{overflow:visible!important}
+  .fr > .fst > span,.fr > .fop > span{font-size:7px!important;padding:1px 3px!important;letter-spacing:.2px!important}
+  .cols.ca,.cols.cd{grid-template-columns:1.1fr 22px 40px .7fr .7fr .55fr .55fr .5fr .7fr .4fr!important}
+  .cols.cd{grid-template-columns:1.1fr 22px 40px .7fr .7fr .55fr .5fr .7fr!important}
+  .cols.ca-done{grid-template-columns:1.1fr 22px 40px .7fr .7fr .55fr .55fr .5fr .7fr!important}
+  .cols.cd-done{grid-template-columns:1.1fr 22px 40px .7fr .7fr .55fr .5fr .7fr!important}
+  .fr.ar{grid-template-columns:1.1fr 22px 40px .7fr .7fr .55fr .55fr .5fr .7fr .4fr!important}
+  .fr.arr-done{grid-template-columns:1.1fr 22px 40px .7fr .7fr .55fr .55fr .5fr .7fr!important}
+  .fr.dep,.fr.dep-ground,.fr.dep-gone{grid-template-columns:1.1fr 22px 40px .7fr .7fr .55fr .5fr .7fr!important}
+  .fr.dep-simple{grid-template-columns:1.1fr 22px 40px .7fr .7fr .55fr .5fr .7fr!important}
+  /* Map height shrinks more on phones so the boards aren't pushed below the fold */
+  #map{height:200px;min-height:200px}
+  /* HUD cards wrap tighter */
+  .hc{padding:3px 6px;min-width:38px;font-size:9px}
+  .hc .v{font-size:11px}
+}
+/* iPhone Pro Max class (430-499px viewports — iPhone 15 Pro Max, 16 Pro Max, 17 Pro Max).
+   These devices have ~50px more horizontal room than standard iPhones, so we can relax some
+   columns that were tight at 390px. The 500px-and-under base still applies; this just nudges
+   FROM/SPOT/STATUS up by a few px so longer values like "2nd Line 4" or "🇺🇸 KSDL" don't overflow.
+   Without this, the SPOT column at 47px would clip on rows with multi-line spot names. */
+@media (min-width: 430px) and (max-width: 499px){
+  .cols.ca,.cols.cd{font-size:8px;grid-template-columns:1.05fr 24px 46px .65fr .8fr .55fr .55fr .5fr .85fr .4fr!important}
+  .cols.cd{grid-template-columns:1.05fr 24px 46px .65fr .8fr .55fr .5fr .85fr!important}
+  .cols.ca-done{grid-template-columns:1.05fr 24px 46px .65fr .8fr .55fr .55fr .5fr .85fr!important}
+  .cols.cd-done{grid-template-columns:1.05fr 24px 46px .65fr .8fr .55fr .5fr .85fr!important}
+  .fr.ar{grid-template-columns:1.05fr 24px 46px .65fr .8fr .55fr .55fr .5fr .85fr .4fr!important}
+  .fr.arr-done{grid-template-columns:1.05fr 24px 46px .65fr .8fr .55fr .55fr .5fr .85fr!important}
+  .fr.dep,.fr.dep-ground,.fr.dep-gone{grid-template-columns:1.05fr 24px 46px .65fr .8fr .55fr .5fr .85fr!important}
+  .fr.dep-simple{grid-template-columns:1.05fr 24px 46px .65fr .8fr .55fr .5fr .85fr!important}
+  /* Pills can be slightly larger on Pro Max — 8px font reads better at this width */
+  .fr > .fst > span,.fr > .fop > span{font-size:7.5px!important;padding:1px 4px!important}
+  /* Map gets back some height since we have more vertical space too */
+  #map{height:240px;min-height:240px}
+}
+  .fr{font-size:8.5px!important;padding:5px 4px!important}
+  .fi{font-size:9.5px!important}
+  .cols.ca,.cols.cd{grid-template-columns:1fr 20px 36px .7fr .7fr .5fr .5fr .5fr .65fr .35fr!important;font-size:7px!important}
+  .cols.cd{grid-template-columns:1fr 20px 36px .7fr .7fr .5fr .5fr .65fr!important}
+  .fr.ar{grid-template-columns:1fr 20px 36px .7fr .7fr .5fr .5fr .5fr .65fr .35fr!important}
+  .fr.dep,.fr.dep-ground,.fr.dep-gone{grid-template-columns:1fr 20px 36px .7fr .7fr .5fr .5fr .65fr!important}
+  .fr.arr-done{grid-template-columns:1fr 20px 36px .7fr .7fr .5fr .5fr .5fr .65fr!important}
+  .fr.dep-simple{grid-template-columns:1fr 20px 36px .7fr .7fr .5fr .5fr .65fr!important}
+}
+
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/twemoji.min.js" crossorigin="anonymous"></script>
@@ -491,28 +946,46 @@ img.emoji{height:1em;width:1em;margin:0 .05em 0 .1em;vertical-align:-0.1em;displ
 #cesium-close:hover{background:rgba(255,255,255,.15)}
 #cesium-title{background:rgba(0,0,0,.6);color:#fff;padding:6px 12px;border-radius:6px;font-size:11px;font-weight:700;border:1px solid rgba(255,255,255,.1)}
 #plane-labels{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:50;overflow:hidden}
-.plane-label{pointer-events:auto;position:absolute;font-family:monospace;font-size:9px;font-weight:700;color:#fff;background:rgba(0,0,0,.6);padding:1px 5px;border-radius:3px;white-space:nowrap;cursor:pointer;transform:translate(-50%,-100%);transition:background .15s}.plane-label:hover{background:rgba(59,130,246,.6)}
+.plane-label{pointer-events:auto;position:absolute;font-family:monospace;font-size:9px;font-weight:700;color:#fff;background:rgba(0,0,0,.55);padding:2px 5px;border-radius:3px;white-space:nowrap;cursor:pointer;transform:translate(-50%,0);transition:background .15s;backdrop-filter:blur(3px);box-shadow:0 1px 3px rgba(0,0,0,.4)}.plane-label:hover{background:rgba(59,130,246,.8)}
 </style>
 </head>
 <body>
 <div class="topbar">
 <div class="tb-l"><div class="brand"><div class="brand-i">S</div><span class="brand-n">Skyway</span></div><div class="sep"></div><span style="font-family:var(--sans);font-size:15px;font-weight:700;color:rgba(255,255,255,.65);letter-spacing:3px;text-transform:uppercase">Signature Aviation</span><div class="sep"></div><span class="clk" id="ck">--:--:--</span><span class="ga">GA ONLY</span></div>
 <div class="tb-c"><span class="apt" id="ac">KSFO</span><span class="apn" id="an">San Francisco Intl</span></div>
-<div class="tb-r"><div class="pill live" id="pill"><div class="dot"></div><span id="pt">CONNECTING</span></div><div class="sep"></div><div class="fd on" id="fo"><div class="d"></div>OPENSKY</div><div class="fd off" id="fadsb"><div class="d"></div>ADSB</div><div class="fd on" id="ffa"><div class="d"></div>FLIGHTAWARE</div><div class="fd off" id="fs"><div class="d"></div>SWIM</div><div class="sep"></div><button class="ib" onclick="doRefresh()">⟳</button><button class="ib" onclick="doCenter()">⊕</button></div>
+<div class="tb-r"><div class="pill live" id="pill"><div class="dot"></div><span id="pt">CONNECTING</span></div><div class="sep"></div><div class="fd on" id="fo"><div class="d"></div>OPENSKY</div><div class="fd on" id="ffa"><div class="d"></div>FLIGHTAWARE</div><div class="sep"></div><div class="fd on" id="fcr" style="cursor:pointer" onclick="showCreditDetails()" title="Click for OpenSky credit details"><div class="d"></div><span id="fcrVal">—</span></div><div class="sep"></div><button class="ib" onclick="doRefresh()">⟳</button><button class="ib" onclick="doCenter()">⊕</button></div>
 </div>
 <div class="map-row" id="mapRow">
 <div class="map-area"><div id="map"></div>
-<div class="hud"><div class="hc b"><span class="v" id="ht">0</span><span class="l">Arr &lt;60m</span></div><div class="hc a" style="cursor:pointer" onclick="showGround()"><span class="v" id="hg">0</span><span class="l">On Ground</span></div><div class="hc c"><span class="v" id="hd">0</span><span class="l">Dep <60m</span></div><div class="hc" style="cursor:pointer;background:rgba(59,130,246,.15);border-color:rgba(59,130,246,.3)" onclick="showRampView()"><span class="v" style="font-size:14px">🗺</span><span class="l">Ramp View</span></div></div>
+<div class="hud"><div class="hc b"><span class="v" id="ht">0</span><span class="l">Arr &lt;60m</span></div><div class="hc a" style="cursor:pointer" onclick="showGround()"><span class="v" id="hg">0</span><span class="l">On Ground</span></div><div class="hc c"><span class="v" id="hd">0</span><span class="l">Dep &lt;60m</span></div><div class="hc heli-hud" id="heliHudCell" style="cursor:pointer;display:none" onclick="showHeliPanel()" title="Click to open live helicopter monitor"><span class="v" id="hh" style="color:#dc2626">0</span><span class="l" style="color:#dc2626">🚁 Heli &lt;15nm</span></div></div>
 </div>
 <div class="chart-area">
-<div style="font-family:var(--mono);font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--t3);margin-bottom:6px;display:flex;justify-content:space-between;align-items:center"><span>Hourly Forecast</span><span style="display:flex;gap:12px;font-size:7px"><span style="display:flex;align-items:center;gap:3px"><span style="width:6px;height:6px;border-radius:1px;background:#3b82f6"></span>Arr</span><span style="display:flex;align-items:center;gap:3px"><span style="width:6px;height:6px;border-radius:1px;background:#dc2626"></span>Dep</span></span></div>
+<div style="font-family:var(--mono);font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--t3);margin-bottom:6px;display:flex;justify-content:space-between;align-items:center"><span>Hourly Forecast</span><span style="display:flex;gap:10px;font-size:7px"><span style="display:flex;align-items:center;gap:3px"><span style="width:6px;height:6px;border-radius:1px;background:#3b82f6"></span>Arr</span><span style="display:flex;align-items:center;gap:3px"><span style="width:6px;height:6px;border-radius:1px;background:linear-gradient(180deg,#fbbf24,#d97706)"></span>On Gnd</span><span style="display:flex;align-items:center;gap:3px"><span style="width:6px;height:6px;border-radius:1px;background:#dc2626"></span>Dep</span></span></div>
 <div id="chartBars" style="flex:1;display:flex;align-items:stretch;gap:2px"></div>
+</div>
+</div>
+<div id="heli-overlay" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.4);z-index:9999" onclick="if(event.target===this)closeHeliPanel()">
+<div style="position:absolute;top:10%;left:50%;transform:translateX(-50%);width:90%;max-width:760px;max-height:80vh;background:var(--b1);border:1px solid var(--bd);border-radius:10px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.3)">
+<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 20px;border-bottom:1px solid var(--bd);background:var(--b0)"><span style="font-family:var(--mono);font-size:13px;font-weight:700;color:#dc2626">🚁 INBOUND HELICOPTER MONITOR</span><button onclick="closeHeliPanel()" style="background:none;border:none;font-size:18px;cursor:pointer;color:var(--t3)">✕</button></div>
+<div id="heli-panel" style="overflow-y:auto;max-height:calc(80vh - 50px)"></div>
 </div>
 </div>
 <div id="gnd-overlay" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.3);z-index:9999" onclick="if(event.target===this)closeGround()">
 <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:90%;max-width:900px;max-height:85vh;background:var(--b1);border:1px solid var(--bd);border-radius:10px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.2)">
 <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 20px;border-bottom:1px solid var(--bd);background:var(--b0)"><span style="font-family:var(--mono);font-size:13px;font-weight:700;color:var(--t1)">✈ Aircraft On Ground at KSFO</span><button onclick="closeGround()" style="background:none;border:none;font-size:18px;cursor:pointer;color:var(--t3)">✕</button></div>
 <div id="gnd-table" style="padding:10px 16px;overflow-y:auto;max-height:calc(85vh - 60px)"></div>
+</div>
+</div>
+<div id="shift-overlay" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.75);z-index:9998;overflow-y:auto;padding:20px 0">
+<div style="max-width:1000px;margin:0 auto;background:#fff;border-radius:8px;padding:0;box-shadow:0 10px 40px rgba(0,0,0,.4);overflow:hidden">
+<div style="background:#1e3a5f;color:#fff;padding:14px 20px;display:flex;justify-content:space-between;align-items:center">
+<div style="font-family:Arial,sans-serif;font-size:15px;font-weight:700">📋 Shift Handoff Report</div>
+<div>
+<button onclick="window.print()" style="background:#3b82f6;color:#fff;border:none;border-radius:5px;padding:6px 14px;font-family:monospace;font-size:11px;cursor:pointer;margin-right:8px;font-weight:700">🖨 Print / PDF</button>
+<button onclick="closeShiftReport()" style="background:rgba(255,255,255,.2);color:#fff;border:none;border-radius:5px;padding:6px 14px;font-family:monospace;font-size:11px;cursor:pointer;font-weight:700">✕ Close</button>
+</div>
+</div>
+<div id="shift-content" style="padding:16px 20px;color:#1a1a1a"></div>
 </div>
 </div>
 <div id="cesium-overlay">
@@ -526,26 +999,418 @@ img.emoji{height:1em;width:1em;margin:0 .05em 0 .1em;vertical-align:-0.1em;displ
 <span style="font-family:var(--mono);font-size:13px;font-weight:700;color:var(--t1)">🗺 RAMP VIEW — Signature SFO</span>
 <div style="display:flex;gap:8px;align-items:center">
 <span style="font-family:var(--mono);font-size:9px;color:var(--t3)">Drag planes to reassign spots</span>
+<button onclick="openTailLookup()" style="background:var(--blue);color:#fff;border:none;border-radius:4px;padding:5px 10px;font-family:var(--mono);font-size:10px;font-weight:700;cursor:pointer">+ Add Plane</button>
 <button onclick="closeRamp()" style="background:none;border:none;font-size:18px;cursor:pointer;color:var(--t3)">✕</button>
 </div>
 </div>
+<div style="flex:1;display:flex;min-height:0">
+<div id="rampUnassigned" style="width:200px;background:var(--b0);border-right:1px solid var(--bd);overflow-y:auto;display:flex;flex-direction:column">
+<div style="padding:8px 10px;font-family:var(--mono);font-size:10px;font-weight:800;color:var(--t1);border-bottom:1px solid var(--bd);background:var(--b1);position:sticky;top:0;z-index:1">UNASSIGNED <span id="rampUnassignedCount" style="color:var(--amber);font-weight:700;margin-left:4px">0</span></div>
+<div id="rampUnassignedList" style="padding:6px 4px;flex:1;overflow-y:auto"></div>
+<div style="padding:6px 8px;font-family:var(--mono);font-size:8px;color:var(--t3);border-top:1px solid var(--bd);line-height:1.4">Drag a plane to a spot on the map. Assignment saves to the rest of the dashboard.</div>
+</div>
 <div id="rampMap" style="flex:1"></div>
+</div>
+
+</div>
+</div>
+<!-- Tail number lookup modal -->
+<div id="tail-lookup-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.65);z-index:10001;backdrop-filter:blur(4px)" onclick="if(event.target===this)closeTailLookup()">
+<div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);background:var(--b1);border:1px solid var(--bd);border-radius:12px;padding:24px;min-width:500px;max-width:90vw;max-height:85vh;overflow-y:auto;box-shadow:0 20px 80px rgba(0,0,0,.5)">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+<div style="font-family:var(--mono);font-size:14px;font-weight:800;color:var(--t1)">🔍 Lookup Aircraft by Tail Number</div>
+<button onclick="closeTailLookup()" style="background:none;border:none;font-size:18px;cursor:pointer;color:var(--t3)">✕</button>
+</div>
+<div style="display:flex;gap:8px;margin-bottom:16px">
+<input id="tailLookupInput" type="text" placeholder="N123AB" style="flex:1;font-family:var(--mono);font-size:14px;font-weight:700;padding:9px 12px;border:1px solid var(--bd);border-radius:6px;background:var(--b0);color:var(--t1);text-transform:uppercase" onkeydown="if(event.key===&quot;Enter&quot;)doTailLookup()"/>
+<button onclick="doTailLookup()" style="background:var(--blue);color:#fff;border:none;border-radius:6px;padding:9px 18px;font-family:var(--mono);font-size:12px;font-weight:700;cursor:pointer">LOOKUP</button>
+</div>
+<div id="tailLookupResult" style="font-family:var(--mono);font-size:11px;color:var(--t2);min-height:40px"></div>
 </div>
 </div>
 <div class="resize-bar" id="resizeBar"><div class="resize-grip"></div></div>
 <div class="boards">
-<div class="board"><div class="bh"><div class="bt ar">🛬 En Route / Scheduled to SFO</div><span class="bc" id="anc">0</span></div><div class="cols ca"><span>Ident</span><span>Type</span><span>From</span><span>Depart</span><span>Arrive</span><span>ETA</span><span>Spot</span><span>PAX</span></div><div class="bb" id="ab"></div></div>
-<div class="board"><div class="bh"><div class="bt de">🛫 Scheduled Departures</div><span class="bc" id="dnc">0</span></div><div class="cols cd"><span>Ident</span><span>Type</span><span>To</span><span>Depart</span><span>ETD</span><span>Spot</span><span>Cat</span><span>CIP</span><span>Fuel</span><span>Lav</span><span>H2O</span></div><div class="bb" id="db"></div></div>
+<div class="board"><div class="bh"><div class="bt ar">🛬 En Route / Scheduled to SFO</div><span class="bc" id="anc">0</span></div><div class="cols ca"><span>Ident</span><span></span><span></span><span>Type</span><span>From</span><span>Depart</span><span>Arrive</span><span>ETA</span><span>Spot</span><span>PAX</span></div><div class="bb" id="ab"></div></div>
+<div class="board"><div class="bh"><div class="bt de">🛫 Scheduled Departures</div><span class="bc" id="dnc">0</span></div><div class="cols cd"><span>Ident</span><span></span><span></span><span>Type</span><span>To</span><span>Depart</span><span>ETD</span><span>Spot</span></div><div class="bb" id="db"></div></div>
 </div>
 <div class="boards done-boards">
-<div class="board"><div class="bh done-hdr" id="ah" style="display:none"><div class="bt ar" style="opacity:.5">✓ Arrived</div><span class="bc" id="adc">0</span></div><div class="cols ca-done" id="ahcols" style="display:none"><span>Ident</span><span>Type</span><span>From</span><span>Depart</span><span>Arrive</span><span>Time</span><span>Spot</span></div><div class="bb" id="adb" style="display:none"></div></div>
-<div class="board"><div class="bh done-hdr" id="dh" style="display:none"><div class="bt de" style="opacity:.5">✓ Departed</div><span class="bc" id="ddc">0</span></div><div class="cols cd-done" id="dhcols" style="display:none"><span>Ident</span><span>Type</span><span>To</span><span>Depart</span><span>Time</span><span>Spot</span></div><div class="bb" id="ddb" style="display:none"></div></div>
+<div class="board"><div class="bh done-hdr" id="ah" style="display:none"><div class="bt ar" style="opacity:.5">✓ Arrived</div><span class="bc" id="adc">0</span></div><div class="cols ca-done" id="ahcols" style="display:none"><span>Ident</span><span></span><span></span><span>Type</span><span>From</span><span>Depart</span><span>Arrive</span><span>Time</span><span>Spot</span></div><div class="bb" id="adb" style="display:none"></div></div>
+<div class="board"><div class="bh done-hdr" id="dh" style="display:none"><div class="bt de" style="opacity:.5">✓ Departed</div><span class="bc" id="ddc">0</span></div><div class="cols cd-done" id="dhcols" style="display:none"><span>Ident</span><span></span><span></span><span>Type</span><span>To</span><span>Depart</span><span>Time</span><span>Spot</span></div><div class="bb" id="ddb" style="display:none"></div></div>
 </div>
 </body>
 <` + `script>
 // === SKYWAY DASHBOARD ===
-var MODEL={C172:'Skyhawk',C182:'Skylane',C206:'Stationair',C208:'Caravan',C210:'Centurion',C25A:'CJ2',C25B:'CJ3',C25C:'CJ4',C500:'Citation I',C510:'Mustang',C525:'CJ1',C550:'Citation II',C560:'Citation V',C56X:'Excel',C680:'Sovereign',C68A:'Latitude',C700:'Longitude',C750:'Citation X',CL30:'Challenger 300',CL35:'Challenger 350',CL60:'Challenger 600',CRJ2:'CRJ-200',E35L:'Legacy 600',E545:'Legacy 450',E550:'Praetor 600',E55P:'Phenom 300',EA50:'Eclipse 500',F2TH:'Falcon 2000',F900:'Falcon 900',FA6X:'Falcon 6X',FA7X:'Falcon 7X',FA8X:'Falcon 8X',G150:'G150',G200:'G200',G280:'G280',GA4C:'G400',GA5C:'G500',GA6C:'G600',GA7C:'G700',GA8C:'G800',GALX:'Galaxy',GL5T:'Global 5500',GL7T:'Global 7500',GLEX:'G650',GLF2:'GII',GLF3:'GIII',GLF4:'GIV',GLF5:'GV/G550',GLF6:'G650/G650ER',GX6C:'Global 6500',H25B:'Hawker 800',HA4T:'HondaJet',HDJT:'HondaJet',LJ35:'Learjet 35',LJ45:'Learjet 45',LJ60:'Learjet 60',LJ75:'Learjet 75',PA28:'Cherokee',PA32:'Saratoga',PA46:'Malibu',PC12:'PC-12',PC24:'PC-24',PRM1:'Premier I',SF50:'Vision Jet',SR22:'SR22',SR20:'SR20',TBM7:'TBM 700',TBM8:'TBM 850',TBM9:'TBM 900',B350:'King Air 350',BE20:'King Air 200',BE36:'Bonanza',BE40:'Beechjet 400',BE58:'Baron',BE9L:'King Air C90',ASTR:'Astra',B06:'JetRanger',EC35:'EC135',EC45:'EC145',S76:'S-76',A139:'AW139'};
+
+
+var MODEL={
+// Cessna piston
+C140:'150/140',C152:'150/152',C170:'170',C172:'Skyhawk',C175:'175',C177:'Cardinal',C182:'Skylane',C185:'Skywagon',C195:'190/195',C205:'205',C206:'Stationair',C208:'Caravan',C210:'Centurion',
+C303:'Crusader',O1:'Bird Dog',C310:'310',C320:'320',C340:'335/340',C337:'Skymaster',C402:'401/402',C404:'Titan',C408:'Skycourier',C411:'411',C414:'Chancellor',C421:'Golden Eagle',C425:'Conquest I',C441:'Conquest II',
+// Cessna Citation
+C500:'Citation I',C510:'Mustang',C525:'CJ1',C25A:'CJ2',C25B:'CJ3',C25C:'CJ4',C550:'Citation II',C551:'S550',C560:'Citation V',C56X:'Excel',C650:'Citation III',C680:'Sovereign',C68A:'Latitude',C700:'Longitude',C750:'Citation X',CDEN:'Denali',
+// Cirrus
+SR20:'SR20',SR22:'SR22',SF50:'Vision Jet',
+// Beech/Beechcraft
+BE17:'Staggerwing',BE18:'Twin Beech',B190:'1900',BE20:'King Air 200',B350:'King Air 350',BE23:'Musketeer',BE36:'Bonanza',BE40:'Beechjet 400',BE50:'Twin Bonanza',BE58:'Baron',BE60:'Duke',BE65:'Queen Air',BE76:'Duchess',BE95:'Travel Air',BE99:'C99',BE9L:'King Air C90',PRM1:'Premier I',S200:'Starship',
+// Dassault
+FA10:'Falcon 10',FA20:'Falcon 20',F2TH:'Falcon 2000',FA50:'Falcon 50',FA5X:'Falcon 5X',FA6X:'Falcon 6X',FA7X:'Falcon 7X',FA8X:'Falcon 8X',F900:'Falcon 900',
+// Embraer
+E110:'EMB-110',E120:'EMB-120',E121:'Xingu',E135:'ERJ-135',E170:'ERJ-170',E190:'ERJ-190',E35L:'Legacy 600',E545:'Legacy 450',E55P:'Phenom 300',E50P:'Phenom 100',E550:'Praetor 600',
+// Bombardier
+CL30:'Challenger 300',CL35:'Challenger 350',CL60:'Challenger 600',CL2T:'CL-215/415',CL44:'CL-44',CRJ2:'CRJ-200',CRJ7:'CRJ-700',CRJ9:'CRJ-900',CRJX:'CRJ-1000',GLEX:'Global Express',GL5T:'Global 5500',GL7T:'Global 7500',GX6C:'Global 6500',BCS1:'CS100',BCS3:'CS300',
+// Gulfstream
+G150:'G150',G200:'G200',G280:'G280',GA4C:'G400',GA5C:'G500',GA6C:'G600',GA7C:'G700',GA8C:'G800',GLF2:'GII',GLF3:'GIII',GLF4:'GIV',GLF5:'GV/G550',GLF6:'G650/G650ER',G159:'GI',GALX:'Galaxy',
+// Hawker
+H25B:'Hawker 800',A748:'HS748',
+// HondaJet
+HDJT:'HondaJet',HA4T:'HondaJet Elite',
+// Learjet
+LJ23:'Learjet 24',LJ25:'Learjet 25',LJ35:'Learjet 35',LJ45:'Learjet 45',LJ55:'Learjet 55',LJ60:'Learjet 60',LJ75:'Learjet 75',LJ85:'Learjet 85',
+// Lockheed
+L10:'Electra',L12:'L-12',L18:'Lodestar',L4J:'Jetstar',
+// Piaggio/Pilatus
+P180:'Avanti',PC6T:'PC-6',PC7:'PC-7',PC9:'PC-9',PC12:'PC-12',PC21:'PC-21',PC24:'PC-24',
+// Piper
+PA18:'Super Cub',PA23:'Apache/Aztec',PA24:'Comanche',P28A:'Cherokee',PA28:'Cherokee',PA30:'Twin Comanche',PA31:'Navajo',PAY1:'Cheyenne I/II',PA32:'Saratoga',PA34:'Seneca',PAY3:'Cheyenne III/IV',PA44:'Seminole',P46T:'Meridian/M600',PA46:'Malibu',
+// Socata/Daher TBM
+TBM7:'TBM 700',TBM8:'TBM 850',TBM9:'TBM 900',TBM:'TBM',
+// Mitsubishi
+MU2:'MU-2',MU30:'MU-300',MRJ7:'MRJ70',MRJ9:'MRJ90',
+// Mooney
+M20P:'M20',M22:'M22',
+// Eclipse
+EA50:'Eclipse 500',EPIC:'E1000',ELIT:'Epic Elite',EVIC:'Epic Victory',
+// Helicopters
+B06:'206 JetRanger',B407:'407',B427:'427',B429:'429',A109:'109',A139:'AW139',AS50:'AS350',AS65:'Dauphin 2',EC20:'EC120',EC30:'EC130',EC35:'EC135',EC45:'EC145',EC55:'EC155',EC25:'EC255',S43:'S-43',S61:'S-61',S76:'S-76',
+// Diamond / Boeing / Airbus / Misc
+DA20:'DA20',DA40:'DA40',DA42:'DA42',DA62:'DA62',D338:'338',GA8:'GA-8',NOMA:'Nomad',T50:'T-50',F3:'Trimotor',
+A306:'A300',A310:'A310',A320:'A320',A342:'A340',A359:'A350',A388:'A380',A400:'A400M',
+B703:'707',B712:'717',B721:'727',B732:'737',B737:'737NG',B741:'747',B752:'757',B762:'767',B772:'777',B788:'787',B247:'247',B307:'307',B377:'Stratocruiser',B720:'720',
+ASTR:'Astra',CONC:'Concorde',C390:'C-390',M90:'Astra 90',S601:'Corvette'
+};
+// ===== AIRCRAFT ICON LIBRARY (FR24-style top-down silhouettes) =====
+// Each path is drawn nose-up in a 100x100 viewBox centered at (50,50).
+// Categories: heavy_jet, mid_jet, light_jet, turboprop, heavy_airliner, helicopter, generic
+var ACFT_ICONS={
+  // Heavy airliner (747, A380, 777, 787, A350) - long fuselage, large swept wings, prominent tail
+  heavy_airliner:'M50 5 C52 5 53 9 53 16 L54 28 L57 30 L57 32 L54 32 L54 38 L88 49 L90 49 L90 53 L88 53 L54 46 L54 64 L65 73 L65 76 L52 73 L52 86 L60 92 L60 94 L50 92 L40 94 L40 92 L48 86 L48 73 L35 76 L35 73 L46 64 L46 46 L12 53 L10 53 L10 49 L12 49 L46 38 L46 32 L43 32 L43 30 L46 28 L47 16 C47 9 48 5 50 5 Z',
+  // Mid-size airliner (737, A320, 757, 767) - medium fuselage, swept wings
+  mid_airliner:'M50 8 C52 8 53 12 53 18 L54 30 L83 47 L85 47 L85 51 L83 51 L54 44 L54 62 L62 70 L62 73 L51 70 L51 84 L57 89 L57 91 L50 89 L43 91 L43 89 L49 84 L49 70 L38 73 L38 70 L46 62 L46 44 L17 51 L15 51 L15 47 L17 47 L46 30 L47 18 C47 12 48 8 50 8 Z',
+  // Heavy bizjet (Global Express, GLF6, BBJ) - long fuselage, swept wings with winglets, T-tail
+  heavy_jet:'M50 8 C52 8 53 12 53 18 L54 32 L82 46 L84 46 L86 44 L88 46 L86 50 L84 50 L82 50 L54 42 L54 62 L62 70 L62 73 L52 71 L52 86 L58 90 L58 92 L50 91 L42 92 L42 90 L48 86 L48 71 L38 73 L38 70 L46 62 L46 42 L18 50 L16 50 L14 50 L12 46 L14 44 L16 46 L18 46 L46 32 L47 18 C47 12 48 8 50 8 Z',
+  // Mid bizjet (Challenger, Falcon, Citation X, Global) - medium fuselage, swept wings, T-tail
+  mid_jet:'M50 10 C52 10 53 14 53 20 L54 33 L78 46 L80 46 L80 49 L78 49 L54 42 L54 60 L60 67 L60 70 L52 68 L52 84 L57 88 L57 90 L50 89 L43 90 L43 88 L48 84 L48 68 L40 70 L40 67 L46 60 L46 42 L22 49 L20 49 L20 46 L22 46 L46 33 L47 20 C47 14 48 10 50 10 Z',
+  // Light bizjet (Citation, Phenom, HondaJet, Mustang) - short fuselage, smaller wings
+  light_jet:'M50 14 C52 14 53 17 53 22 L54 34 L73 46 L75 46 L75 49 L73 49 L54 43 L54 60 L58 65 L58 68 L52 67 L52 78 L56 82 L56 84 L50 83 L44 84 L44 82 L48 78 L48 67 L42 68 L42 65 L46 60 L46 43 L27 49 L25 49 L25 46 L27 46 L46 34 L47 22 C47 17 48 14 50 14 Z',
+  // Turboprop twin (King Air, PC-12, TBM, MU-2) - straight wings with engine bumps
+  turboprop:'M50 12 C52 12 53 15 53 20 L54 30 L42 32 L42 28 L40 28 L40 32 L20 40 L18 40 L18 46 L20 46 L46 42 L46 60 L52 66 L52 68 L50 67 L48 68 L48 66 L54 60 L54 42 L80 46 L82 46 L82 40 L80 40 L60 32 L60 28 L58 28 L58 32 L46 30 L47 20 C47 15 48 12 50 12 Z',
+  // Single-engine piston (Cessna 172, Cirrus, Bonanza) - fixed gear, small high/low wing
+  single_piston:'M50 16 C52 16 53 18 53 22 L54 30 L24 36 L22 36 L22 42 L24 42 L46 38 L46 56 L50 60 L50 62 L48 62 L46 60 L46 56 M54 38 L76 42 L78 42 L78 36 L76 36 L54 30 M52 60 L52 62 L50 62 L52 60 M50 12 L48 16 M50 12 L52 16',
+  // Helicopter (Bell, Sikorsky, Airbus heli) - rotor disc + body
+  helicopter:'M50 30 C56 30 60 34 60 42 C60 50 56 54 50 54 C44 54 40 50 40 42 C40 34 44 30 50 30 Z M50 18 L50 66 M52 18 L52 66 M48 18 L48 66 M22 40 L78 44 M22 44 L78 40',
+  // Generic fallback (looks like a simple jet)
+  generic:'M50 14 C52 14 53 17 53 22 L54 34 L77 47 L79 47 L79 50 L77 50 L54 43 L54 62 L60 68 L60 71 L51 69 L42 71 L42 68 L46 62 L46 43 L23 50 L21 50 L21 47 L23 47 L46 34 L47 22 C47 17 48 14 50 14 Z'
+};
+// Map ICAO aircraft type code -> icon category
+function iconForType(acType){
+  if(!acType)return'generic';
+  var t=acType.toUpperCase();
+  if(HELI[t])return'helicopter';
+  // Helicopters by code prefix (extra coverage)
+  if(/^(B06|B06T|B212|B214|B222|B230|B407|B412|B427|B429|B430|B47|B505|B525|A109|A119|A129|A139|A149|A169|A189|AS50|AS55|AS65|AS32|EC20|EC25|EC30|EC35|EC45|EC55|EC75|H125|H130|H135|H145|H155|H160|H175|H215|H225|R22|R44|R66|S43|S55|S58|S61|S64|S65|S70|S76|S92|EH10|EH101|NH90|MD52|MD60|MD90|MD9)$/.test(t))return'helicopter';
+  // Heavy airliner
+  if(/^(B741|B742|B743|B744|B748|B752|B753|B762|B763|B764|B772|B773|B777|B77L|B77W|B788|B789|B78X|A306|A310|A330|A332|A333|A338|A339|A342|A343|A345|A346|A359|A35K|A388|MD11|IL96)$/.test(t))return'heavy_airliner';
+  // Mid airliner (narrowbody)
+  if(/^(A318|A319|A320|A321|A19N|A20N|A21N|B731|B732|B733|B734|B735|B736|B737|B738|B739|B37M|B38M|B39M|B3XM|B701|B703|B712|B717|B720|B721|B722|B727|MD80|MD81|MD82|MD83|MD88|MD90|CRJ1|CRJ2|CRJ7|CRJ9|CRJX|E170|E175|E190|E195|E75L|E75S|E290|E295|BCS1|BCS3|A220|F70|F100)$/.test(t))return'mid_airliner';
+  // Heavy bizjet (105ft+ wingspan, ultra-long range, with winglets)
+  if(/^(GL7T|GL5T|GLEX|GLF6|GLF5|GA7C|GA8C|GA6C|GX6C|BBJ|ACJ|GA5C)$/.test(t))return'heavy_jet';
+  // Mid bizjet
+  if(/^(CL30|CL35|CL60|CL64|CL65|F2TH|FA7X|FA8X|FA6X|FA5X|F900|GLF4|GLF3|GLF2|G280|G200|GA4C|E35L|E545|E550|GALX|H25B|H25C|FA50|FA20|FA10)$/.test(t))return'mid_jet';
+  // Light bizjet
+  if(/^(C25A|C25B|C25C|C500|C510|C525|C550|C551|C560|C56X|C56V|C650|C680|C68A|C700|C750|CDEN|E50P|E55P|EA50|EA55|HA4T|HDJT|LJ23|LJ25|LJ31|LJ35|LJ40|LJ45|LJ55|LJ60|LJ70|LJ75|LJ85|SF50|SF60|PRM1|PRM4|MU30|G150)$/.test(t))return'light_jet';
+  // Turboprop
+  if(/^(PC6T|PC7|PC9|PC12|PC21|PC24|TBM7|TBM8|TBM9|TBM|BE20|B350|BE9L|BE9T|BE40|BE99|B190|MU2|PAY1|PAY2|PAY3|PAY4|PA31|PA42|P46T|P180|C208|C402|C404|C408|C425|C441|EPIC|D328|AT43|AT45|AT72|AT75|AT76|DH8A|DH8B|DH8C|DH8D|E110|E120|E121|SF34|F50|F27|M28|BE30)$/.test(t))return'turboprop';
+  // Single-engine piston (or twin piston with tractor props)
+  if(/^(C140|C150|C152|C170|C172|C175|C177|C180|C182|C185|C195|C205|C206|C207|C210|C310|C320|C337|C340|C411|C414|C421|C303|SR20|SR22|SR2T|PA18|PA22|PA23|PA24|P28A|P28B|P28R|P28T|PA28|PA30|PA32|PA34|PA38|PA44|PA46|BE17|BE18|BE19|BE23|BE24|BE33|BE35|BE36|BE50|BE55|BE56|BE58|BE60|BE65|BE76|BE77|BE95|DA20|DA40|DA42|DA50|DA62|M20P|M20T|M22|GA8|NOMA)$/.test(t))return'single_piston';
+  // Default
+  return'generic';
+}
+// Render an icon as SVG markup (for HTML overlays - main map, ramp view)
+// rotation in degrees, color, optional size
+function svgIcon(acType,rotation,color,size,strokeColor){
+  var cat=iconForType(acType);
+  var path=ACFT_ICONS[cat]||ACFT_ICONS.generic;
+  var sz=size||24;
+  var stroke=strokeColor||'#fff';
+  var rot=rotation||0;
+  var strokeWidth=cat==='helicopter'?2.5:2;
+  return '<svg width="'+sz+'" height="'+sz+'" viewBox="0 0 100 100" style="filter:drop-shadow(0 1px 2px rgba(0,0,0,.4));transform:rotate('+rot+'deg)" xmlns="http://www.w3.org/2000/svg"><path d="'+path+'" fill="'+color+'" stroke="'+stroke+'" stroke-width="'+strokeWidth+'" stroke-linejoin="round" stroke-linecap="round"/></svg>';
+}
+// Render an icon onto a canvas (for 3D textured plane meshes)
+function drawIconOnCanvas(ctx,acType,size,colorHex){
+  var cat=iconForType(acType);
+  var path=ACFT_ICONS[cat]||ACFT_ICONS.generic;
+  var p=new Path2D(path);
+  ctx.save();
+  // Path is in 100x100 coords, scale to canvas size
+  var scale=size/100;
+  ctx.scale(scale,scale);
+  ctx.fillStyle=colorHex;
+  ctx.strokeStyle='rgba(255,255,255,0.95)';
+  ctx.lineWidth=cat==='helicopter'?3:2.5;
+  ctx.lineJoin='round';
+  ctx.lineCap='round';
+  ctx.fill(p);
+  ctx.stroke(p);
+  ctx.restore();
+}
 var HELI={S76:1,EC35:1,EC45:1,B06:1,A139:1,AS50:1,AS55:1,EC30:1,EC55:1,H60:1,R22:1,R44:1,R66:1,BK17:1,B407:1,B412:1,B429:1,H500:1,MD52:1,MD60:1,AS65:1,S92:1,AW09:1,AW69:1,AW18:1,H135:1,H145:1,H160:1,H175:1,H215:1,H225:1,B505:1,B105:1,B212:1};
+// Medical transport operators - callsign prefixes and common tail number patterns
+// Source: public NTSB/FAA records + HEMS operator registries
+var MEDICAL_OPS={
+  // Callsign prefixes (first chars of callsign)
+  callsigns:{
+    'REACH':'REACH Air Medical',
+    'CALSTAR':'CALSTAR',
+    'CSR':'CALSTAR',
+    'LIFEFLIGHT':'Life Flight',
+    'LIFEGUARD':'Lifeguard',
+    'MEDEVAC':'MEDEVAC',
+    'MERCY':'Mercy Flight',
+    'PHI':'PHI Air Medical',
+    'PHIMED':'PHI Air Medical',
+    'MEDIC':'Air Medical',
+    'STATMED':'STAT MedEvac',
+    'ANGEL':'Angel Flight',
+    'AIRMED':'AirMed',
+    'LIFENET':'LifeNet',
+    'SURVIVAL':'Survival Flight',
+    'AIRLIFE':'AirLife',
+    'AIREVAC':'Air Evac Lifeteam',
+    'NIGHTINGALE':'Nightingale',
+    'MEDSTAR':'MedStar',
+    'METROLIFE':'Metro Life Flight',
+    'FLIGHTFORLIFE':'Flight For Life',
+    'MERCYAIR':'Mercy Air',
+    'GUARDIAN':'Guardian Flight',
+    'CLASSIC':'Classic Air Medical',
+    'AEROMED':'AeroMed',
+    'SKYHEALTH':'SkyHealth',
+    'MEMORIAL':'Memorial Hermann Life Flight',
+    'TEAMLIFE':'TeamLife',
+    'STARFLIGHT':'STAR Flight',
+    'PEDIFLITE':'PediFlite',
+    'PAFB':'Patrick AFB MedEvac',
+    'DUSTOFF':'Army MedEvac',
+    'MEDLINK':'MedLink',
+    'METRO':'Metro Life Flight',
+    'HALO':'HALO-Flight'
+  },
+  // Exact tail numbers known to be dedicated medical aircraft at SFO/Bay Area
+  // Updated list of REACH/CALSTAR helicopters in Northern California
+  knownTails:{
+    'N911RX':'REACH',
+    'N112FX':'CALSTAR',
+    'N142CS':'CALSTAR',
+    'N151CS':'CALSTAR',
+    'N157CS':'CALSTAR',
+    'N178CS':'CALSTAR',
+    'N195CS':'CALSTAR',
+    'N197CS':'CALSTAR',
+    'N198CS':'CALSTAR'
+  }
+};
+function isMedical(ident,callsign){
+  var i=safeStr(ident).toUpperCase();
+  var c=safeStr(callsign).toUpperCase();
+  if(MEDICAL_OPS.knownTails[i])return MEDICAL_OPS.knownTails[i];
+  // Check callsign prefix match
+  for(var prefix in MEDICAL_OPS.callsigns){
+    if(c.indexOf(prefix)===0||i.indexOf(prefix)===0)return MEDICAL_OPS.callsigns[prefix];
+  }
+  return null;
+}
+// VIP tail list — specific tail numbers that get a VIP badge on arrivals.
+// Edit this set to add/remove VIPs. Matched case-insensitively with stray punctuation stripped.
+var VIP_TAILS={
+  'N950X':true,'N650SB':true,'N808XX':true,'N88L':true,'N652MP':true,
+  'N717NT':true,'N802BC':true,'N800DL':true,'N512GV':true
+};
+function isVip(ident,callsign){
+  var i=safeStr(ident).toUpperCase().replace(/[^A-Z0-9]/g,'');
+  if(VIP_TAILS[i])return true;
+  var c=safeStr(callsign).toUpperCase().replace(/[^A-Z0-9]/g,'');
+  if(VIP_TAILS[c])return true;
+  return false;
+}
+
+// ============================================================================================
+// CORPORATE FLIGHT DEPARTMENTS — GPU PRE-POSITIONING LIST
+// ============================================================================================
+// Large corporate flight departments typically request a ground power unit (GPU) cart spotted
+// before arrival so their aircraft can be cooled/powered without running the APU during
+// pax deplaning. This table identifies arrivals by operator so the crew working the ramp
+// knows to pull a GPU out ahead of time.
+//
+// HOW MATCHING WORKS (in priority order):
+//   1. icaoCallsign — ICAO 3-letter code that operator files with ATC (most reliable)
+//      e.g. Walmart files all its flights as "CGG" so any callsign CGG0123 matches
+//   2. tailPrefix / tailSuffix — pattern in the N-number (for operators without ICAO codes)
+//      e.g. Costco tails end in "CW" (N83CW, N91CW) — owner registrations
+//   3. knownTails — explicit list of tails to catch when patterns don't match
+//
+// HOW TO ADD A NEW OPERATOR:
+//   Just add an entry. Set needsGPU:true if they consistently want GPU on arrival.
+//   If you observe a new tail from an existing operator, drop it into knownTails.
+//   Most entries below are seeded from verifiable public records (FlightAware fleet pages,
+//   PlaneSpotters photos, FAA registry). The list is intentionally conservative — a wrong
+//   tail here would pre-stage a GPU that crews don't want, which is a minor problem but
+//   still noise. Better to start small and add as you confirm.
+//
+// IMPORTANT LIMITATIONS:
+//   - Corporate fleets change. Planes get sold/acquired, LLC ownership gets shuffled.
+//     If a tail stops matching its operator over time, remove it from knownTails.
+//   - Owner LLCs often mask parent company (e.g. Walmart flies many planes under holding
+//     LLCs, not "Walmart Inc" directly). ICAO callsign is the most stable signal.
+//   - needsGPU is a preference flag, not a hard requirement. Any plane CAN take GPU; this
+//     just marks the ones whose operators routinely pre-request.
+// ============================================================================================
+var CORPORATE_OPERATORS={
+  'Walmart': {
+    icaoCallsign:'CGG',          // Walmart Aviation's ATC callsign
+    tailSuffix:null,             // no consistent suffix — they own many LLC-registered tails
+    knownTails:['N45GH'],        // seed: from FAA/FlightAware public records
+    needsGPU:true,
+    label:'GPU',
+    title:'Walmart Aviation — GPU requested'
+  },
+  'Costco': {
+    icaoCallsign:null,           // Costco uses tail-as-callsign, no corporate ICAO code
+    tailSuffix:'CW',             // Costco Wholesale — all their tails end in CW
+    knownTails:['N83CW','N91CW'],// seed: verified G650ER airframes
+    needsGPU:true,
+    label:'GPU',
+    title:'Costco Wholesale — GPU requested'
+  }
+  // To add more operators (Nike 'SWOOSH', Koch, Dell, Microsoft, Tyson Foods, etc.), append
+  // entries following the same shape. Unknown fields can stay null or empty arrays.
+};
+
+// Normalize a string for lookup: upper-case, strip non-alphanumerics. Safe against null/undef.
+function _norm(s){ return safeStr(s).toUpperCase().replace(/[^A-Z0-9]/g,''); }
+
+// Given a flight's ident (tail) and callsign, determine which corporate operator (if any) it
+// belongs to. Returns the operator entry object, or null if no match. Matches icaoCallsign
+// against the filed callsign prefix first (most reliable), then tail patterns.
+function getCorporateOperator(ident, callsign){
+  var t = _norm(ident);
+  var c = _norm(callsign);
+  for(var name in CORPORATE_OPERATORS){
+    var op = CORPORATE_OPERATORS[name];
+    // 1. ICAO callsign match (callsign starts with the 3-letter code, e.g. "CGG0123")
+    if(op.icaoCallsign && c && c.indexOf(op.icaoCallsign.toUpperCase())===0) return op;
+    // 2. Tail suffix (e.g. Costco's CW)
+    if(op.tailSuffix){
+      var suf = op.tailSuffix.toUpperCase();
+      if(t && t.length>=suf.length && t.slice(-suf.length)===suf) return op;
+    }
+    // 3. Tail prefix (unused today but supported — e.g. if an operator uses Nxxxxx prefix)
+    if(op.tailPrefix){
+      var pre = op.tailPrefix.toUpperCase();
+      if(t && t.indexOf(pre)===0) return op;
+    }
+    // 4. Explicit tail allowlist
+    if(op.knownTails){
+      for(var i=0;i<op.knownTails.length;i++){
+        if(_norm(op.knownTails[i])===t) return op;
+      }
+    }
+  }
+  return null;
+}
+
+// Returns true if this flight's operator typically requests GPU on arrival. Used to render
+// the GPU status icon in the STATUS column.
+function needsGPU(ident, callsign){
+  var op = getCorporateOperator(ident, callsign);
+  return !!(op && op.needsGPU);
+}
+
+// Operator brand pill — small color-coded label shown next to the tail number for known
+// fractional/charter operators. Uses each company's brand color as a recognizable visual marker
+// (NOT the licensed logo). Designed so a glance at the board groups planes by operator.
+// To replace text pills with actual logos later, swap the inner HTML for an <img src="..."> tag.
+//
+// Each entry carries both visual properties and operational metadata:
+//   label/bg/fg/border → pill appearance
+//   type               → operator category (see TYPE CLASSIFICATIONS below)
+//   parent             → if this is a sister brand, the parent operator name (for tooltip grouping)
+//   title              → tooltip text shown on hover (autobuilt to include type/parent)
+//
+// TYPE CLASSIFICATIONS (important for ramp ops):
+//   'fractional'  → owners fly frequently on shared airframes (NetJets, Flexjet, VistaJet,
+//                   PlaneSense, Airshare). Established service preferences, repeat visitors.
+//   'charter'     → on-demand charter (XO, Wheels Up retail, FXAIR). One-off trips, charter
+//                   brokers, variable billing flow.
+//   'management'  → operator holds the certificate but the plane is owner-registered (EJM,
+//                   Corporate Wings, Solairus, Clay Lacy, Jet Linx, Jet Access, Priester).
+//                   Owner's preferences usually apply. Many also do charter as a side business.
+//   'mixed'       → offers multiple (e.g., Airshare does fractional+jet-cards+charter+management;
+//                   Flexjet parent brand spans fractional+charter via sister brands).
+var OP_BRANDS={
+  // ---- NetJets family ----
+  // NetJets: fractional ownership (white bg, red text/border)
+  'NetJets':       {label:'NJ',  bg:'#fff',    fg:'#dc2626', border:'#dc2626', type:'fractional', parent:null,      title:'NetJets · fractional'},
+  'NetJets EU':    {label:'NJ',  bg:'#fff',    fg:'#dc2626', border:'#dc2626', type:'fractional', parent:null,      title:'NetJets Europe · fractional'},
+  // EJM (Executive Jet Management) — NetJets' sister brand for aircraft management and charter.
+  // Operates under its own Part 135 certificate with ICAO code EJM, callsign "JetSpeed."
+  // Same parent family as NJ but operationally different (owner-registered tails, often charter).
+  'EJM':           {label:'EJM', bg:'#fff',    fg:'#7f1d1d', border:'#7f1d1d', type:'management', parent:'NetJets', title:'Executive Jet Management · charter/management · NetJets family'},
+  // ---- Flexjet family ----
+  // Flexjet: fractional (blue bg, gold text)
+  'Flexjet':       {label:'FX',  bg:'#0a3b78', fg:'#d4a017', border:'#0a3b78', type:'fractional', parent:null,      title:'Flexjet · fractional'},
+  // Corporate Wings: Flexjet's whole-aircraft management arm (per flexjet.com/programs).
+  // FXAIR is actually Flexjet's charter brand; Corporate Wings is management. Distinct roles.
+  'Corporate Wings':{label:'CW', bg:'#0a3b78', fg:'#fff',    border:'#d4a017', type:'management', parent:'Flexjet', title:'Corporate Wings · management · Flexjet family'},
+  // FXAIR: on-demand charter arm of Flexjet. Seeded for future detection when their ICAO is
+  // confirmed — currently Flexjet flies charter trips under the same LXJ code + tail-as-callsign.
+  'FXAIR':         {label:'FXA', bg:'#0a3b78', fg:'#fbbf24', border:'#0a3b78', type:'charter',    parent:'Flexjet', title:'FXAIR · charter · Flexjet family'},
+  // ---- VistaJet ----
+  // VistaJet: fractional/membership (grey bg, red text)
+  'VistaJet':      {label:'VJ',  bg:'#374151', fg:'#dc2626', border:'#374151', type:'fractional', parent:null,      title:'VistaJet · fractional/membership'},
+  // ---- PlaneSense ----
+  // PlaneSense: fractional (PC-12 and PC-24 fleet, ICAO PEX/callsign "PlaneSense")
+  'PlaneSense':    {label:'PS',  bg:'#0e7490', fg:'#fff',    border:'#0e7490', type:'fractional', parent:null,      title:'PlaneSense · fractional'},
+  // ---- Airshare ----
+  // Airshare: offers fractional + jet cards + charter + management (per flyairshare.com).
+  // Days-based fractional is their differentiator. ICAO XSR, callsign "AIRSHARE."
+  // Tagged as 'mixed' because the operator brand itself covers multiple product lines — ramp
+  // treatment can be similar for all (frequent visitors with repeat preferences).
+  'Airshare':      {label:'AS',  bg:'#0369a1', fg:'#fff',    border:'#0369a1', type:'mixed',      parent:null,      title:'Airshare · fractional/jet-cards/charter (days-based)'},
+  // ---- Wheels Up ----
+  // Wheels Up: retail charter + memberships post-Delta acquisition. White bg with royal blue.
+  'Wheels Up':     {label:'WU',  bg:'#fff',    fg:'#1e3a8a', border:'#1e3a8a', type:'charter',    parent:null,      title:'Wheels Up · charter/membership'},
+  // ---- Baker Aviation ----
+  // Baker: Texas-based charter operator (Fort Worth), ICAO KOW, callsign "RODEO."
+  'Baker Aviation':{label:'BA',  bg:'#1e3a8a', fg:'#fff',    border:'#1e3a8a', type:'charter',    parent:null,      title:'Baker Aviation · charter'},
+  // ---- Other charters / management cos ----
+  'XO':            {label:'XO',  bg:'#000',    fg:'#fff',    border:'#000',    type:'charter',    parent:null,      title:'XO · charter'},
+  'Solairus':      {label:'SOL', bg:'#1f4e8c', fg:'#fff',    border:'#1f4e8c', type:'management', parent:null,      title:'Solairus · management/charter'},
+  'JetEdge':       {label:'JE',  bg:'#5b21b6', fg:'#fff',    border:'#5b21b6', type:'charter',    parent:null,      title:'JetEdge · charter'},
+  'Jet Access':    {label:'JA',  bg:'#0e7490', fg:'#fff',    border:'#0e7490', type:'management', parent:null,      title:'Jet Access · management/charter'},
+  'Clay Lacy':     {label:'CL',  bg:'#0a4f8c', fg:'#fff',    border:'#0a4f8c', type:'management', parent:null,      title:'Clay Lacy · management/charter'},
+  'Jet Linx':      {label:'JL',  bg:'#1f2937', fg:'#fff',    border:'#1f2937', type:'management', parent:null,      title:'Jet Linx · management/charter'},
+  'Jet Aviation':  {label:'JTA', bg:'#0a4f8c', fg:'#fff',    border:'#0a4f8c', type:'management', parent:null,      title:'Jet Aviation · management/charter'},
+  'Priester':      {label:'PR',  bg:'#374151', fg:'#fff',    border:'#374151', type:'management', parent:null,      title:'Priester · management/charter'}
+};
+function opBrandPill(operator){
+  if(!operator)return '';
+  var b=OP_BRANDS[operator];
+  if(!b)return '';
+  // Title string is taken from the entry (already includes type + parent). Old tooltip shape
+  // (just the company name) still works because we kept the title field populated.
+  return '<span title="'+htmlEsc(b.title)+'" style="display:inline-block;background:'+b.bg+';color:'+b.fg+';border:1px solid '+b.border+';font-size:8px;font-weight:900;padding:1px 4px;border-radius:3px;margin-left:4px;letter-spacing:.4px;line-height:1;vertical-align:middle">'+b.label+'</span>';
+}
 var SPAN={GL7T:104,GL5T:94,GLEX:99,GLF6:99,GLF5:93,GLF4:78,GLF3:78,GLF2:69,GA7C:103,GA8C:103,GA6C:94,GA5C:87,GA4C:78,G280:63,G200:58,G150:55,GX6C:94,CL30:64,CL35:69,CL60:64,E35L:69,E545:66,E550:69,E55P:52,EA50:38,F2TH:70,F900:70,FA6X:86,FA7X:86,FA8X:86,C25A:47,C25B:47,C25C:50,C500:47,C510:43,C525:47,C550:52,C560:55,C56X:56,C680:64,C68A:72,C700:69,C750:64,H25B:54,HA4T:40,HDJT:40,LJ35:44,LJ45:48,LJ60:44,LJ75:51,PC12:53,PC24:56,B350:58,BE20:55,BE40:44,BE9L:54,SF50:39,SR22:38,SR20:37,PRM1:44,TBM7:42,TBM8:42,TBM9:42,PA46:43,PA32:37,PA28:35,C172:36,C182:36,C206:36,C208:52,C210:37,B06:33,EC35:33,EC45:36,S76:44,A139:46,ASTR:55};
 // Aircraft wingspan categories
 function getWsCat(acType){
@@ -591,10 +1456,10 @@ var SPOT_DEFS=[
   {name:'42 West 2',cats:[4,5],pri:8},
   {name:'42 West 3',cats:[4,5],pri:8},
   {name:'42 West 4',cats:[4,5],pri:8},
-  {name:'4th Line 1',cats:[4,5],pri:9},
-  {name:'4th Line 2',cats:[4,5],pri:9},
-  {name:'4th Line 3',cats:[4,5],pri:9},
-  {name:'4th Line 4',cats:[4,5],pri:9},
+  {name:'4th Line 1',cats:[4,5],pri:99,restricted:true,note:'requires United approval'},
+  {name:'4th Line 2',cats:[4,5],pri:99,restricted:true,note:'requires United approval'},
+  {name:'4th Line 3',cats:[4,5],pri:99,restricted:true,note:'requires United approval'},
+  {name:'4th Line 4',cats:[4,5],pri:99,restricted:true,note:'requires United approval'},
   {name:'41-7 A',cats:[4,5,6],pri:9},
   {name:'41-7 B',cats:[4,5,6],pri:9},
   {name:'41-11',cats:[4,5],pri:9}
@@ -602,11 +1467,16 @@ var SPOT_DEFS=[
 // Global spot tracker - shared across all views
 if(!window._globalSpotMap)window._globalSpotMap={};
 function getNextAvailable(preferred,cat){
-  // If preferred is free, use it
-  if(!window._globalSpotMap[preferred])return preferred;
-  // Find next spot of same line/type that fits this cat
+  // If preferred is free AND not restricted, use it
+  var preferredDef=null;
+  for(var pi=0;pi<SPOT_DEFS.length;pi++)if(SPOT_DEFS[pi].name===preferred){preferredDef=SPOT_DEFS[pi];break;}
+  if(preferredDef&&preferredDef.restricted){
+    // skip to alternative
+  } else if(!window._globalSpotMap[preferred])return preferred;
+  // Find next spot of same line/type that fits this cat (exclude restricted)
   for(var i=0;i<SPOT_DEFS.length;i++){
     var sd=SPOT_DEFS[i];
+    if(sd.restricted)continue; // never auto-assign restricted spots
     if(sd.cats.indexOf(cat)>=0&&!window._globalSpotMap[sd.name])return sd.name;
   }
   return preferred; // fallback
@@ -656,21 +1526,24 @@ function suggestSpot(acType,stayHrs,isHeli,tailNum){
   window._globalSpotMap[spot]=safeT;
   return {spot:spot,tow:tow};
 }
-function getFlag(code){
+function getFlag(code,isHeli){
   if(!code||code.length<2)return'';
-  // US FAA identifiers: 3 chars, often start with number or non-K letter
-  // These are US airports that don't follow ICAO format
+  var up=code.toUpperCase();
+  // US FAA identifiers: 3 chars
   if(code.length<=3){
-    // If it starts with a digit, it's US
-    if(code.charAt(0)>='0'&&code.charAt(0)<='9')return'🇺🇸';
-    // 3-char codes starting with letters that aren't standard ICAO prefixes are usually US
-    // Known US FAA prefixes that aren't K: letter+digits like O89, L35, S50, etc
-    var ch=code.charAt(0).toUpperCase();
-    if(code.length===3&&'ABCDEFGHIJLNOQRSTUW'.indexOf(ch)>=0&&code.charAt(1)>='0'&&code.charAt(1)<='9')return'🇺🇸';
+    if(up.charAt(0)>='0'&&up.charAt(0)<='9')return'🇺🇸';
+    var ch=up.charAt(0);
+    if(code.length===3&&'ABCDEFGHIJLNOQRSTUW'.indexOf(ch)>=0&&up.charAt(1)>='0'&&up.charAt(1)<='9')return'🇺🇸';
   }
-  var p=code.substring(0,1).toUpperCase();
+  // For helicopters: if code starts with C but isn't CY_/CZ_ (actual Canadian), default to US
+  // Private helipads in CA often have C-prefixed codes that aren't Canadian ICAO
+  if(isHeli&&code.length<=4){
+    var p2u=up.substring(0,2);
+    if(up.charAt(0)==='C'&&p2u!=='CY'&&p2u!=='CZ')return'🇺🇸';
+  }
+  var p=up.substring(0,1);
   var FLAGS={K:'🇺🇸',P:'🇺🇸',C:'🇨🇦',M:'🇲🇽',T:'🇲🇽',L:'🇪🇺',E:'🇪🇺',U:'🇷🇺',Z:'🇨🇳',R:'🇰🇷',V:'🇦🇺',S:'🇧🇷',Y:'🇦🇺',O:'🇯🇵',W:'🇮🇩',F:'🇿🇦',H:'🇪🇬',D:'🇩🇪',B:'🇮🇨'};
-  var p2=code.substring(0,2).toUpperCase();
+  var p2=up.substring(0,2);
   var F2={EG:'🇬🇧',LF:'🇫🇷',ED:'🇩🇪',LI:'🇮🇹',LE:'🇪🇸',EH:'🇳🇱',EB:'🇧🇪',LS:'🇨🇭',LO:'🇦🇹',EK:'🇩🇰',EN:'🇳🇴',ES:'🇸🇪',EF:'🇫🇮',EI:'🇮🇪',LP:'🇵🇹',LG:'🇬🇷',LT:'🇹🇷',LK:'🇨🇿',EP:'🇵🇱',LH:'🇭🇺',LR:'🇷🇴',OE:'🇦🇪',OB:'🇧🇭',OK:'🇰🇼',OI:'🇮🇷',OL:'🇱🇧',OJ:'🇯🇴',LL:'🇮🇱',OO:'🇸🇦',OP:'🇵🇰',VI:'🇮🇳',VE:'🇮🇳',VA:'🇮🇳',RJ:'🇯🇵',RK:'🇰🇷',RC:'🇹🇼',VH:'🇭🇰',WS:'🇸🇬',ZS:'🇨🇳',ZB:'🇨🇳',ZG:'🇨🇳',PH:'🇺🇸',PA:'🇺🇸',SB:'🇧🇷',SC:'🇨🇱',SK:'🇨🇴',SE:'🇪🇨',SP:'🇵🇪',SV:'🇻🇪',TJ:'🇵🇷',TN:'🇦🇼',MK:'🇯🇲',MM:'🇲🇽',MU:'🇨🇺',MY:'🇧🇸',NT:'🇵🇫',NZ:'🇳🇿',YM:'🇦🇺',CY:'🇨🇦',CZ:'🇨🇦',FA:'🇿🇦',FI:'🇿🇦',DN:'🇳🇬',HA:'🇪🇹',HR:'🇪🇬',HB:'🇪🇹',HK:'🇰🇪'};
   return F2[p2]||FLAGS[p]||'';
 }
@@ -680,7 +1553,20 @@ function opBadge(op){
   var c=colors[op]||'#4a5568';
   return '<span style="display:inline-block;font-family:var(--sans);font-size:7px;font-weight:700;color:#fff;background:'+c+';padding:1px 4px;border-radius:3px;margin-right:3px;letter-spacing:.3px;line-height:1.3;vertical-align:middle">'+op+'</span>';
 }
-var AIRLINES=['AAL','ACA','AFR','AIC','AMX','ANA','ANZ','ASA','AWE','BAW','BER','CAL','CCA','CES','CLX','CPA','CSN','DAL','DLH','EIN','ETD','ETH','EVA','FDX','FFT','FIN','GIA','HAL','IBE','ICE','JAL','JBU','KAL','KLM','LAN','LOT','MEA','NAX','NKS','OAL','PAL','QFA','QTR','RAM','RPA','RYR','SAS','SAA','SIA','SKW','SLK','SWA','SWR','TAM','TAP','THA','THY','TSC','TUI','TVF','UAE','UAL','UPS','USA','VIR','VOI','WJA','ENY','PDT','ROU','JZA','GJS','OHY','XJT','TCF','AIP','CPZ','TRS','SCX','FLG'];
+// ICAO 3-letter operator codes for commercial airlines. Used to reject commercial traffic
+// from the regional map view. Not exhaustive — new entries can be added as they appear in logs.
+// Excludes fractional/charter operators like NetJets (EJA), Flexjet (LXJ), VistaJet (VJT) etc.
+// since those ARE the FBO customers.
+var AIRLINES=[
+  'AAL','ACA','AFR','AIC','AMX','ANA','ANZ','ASA','AWE','BAW','BER','CAL','CCA','CES','CLX','CPA','CSN',
+  'DAL','DLH','EIN','ETD','ETH','EVA','FDX','FFT','FIN','GIA','HAL','IBE','ICE','JAL','JBU','KAL','KLM',
+  'LAN','LOT','MEA','NAX','NKS','OAL','PAL','QFA','QTR','RAM','RPA','RYR','SAS','SAA','SIA','SKW','SLK',
+  'SWA','SWR','TAM','TAP','THA','THY','TSC','TUI','TVF','UAE','UAL','UPS','USA','VIR','VOI','WJA','ENY',
+  'PDT','ROU','JZA','GJS','OHY','XJT','TCF','AIP','CPZ','TRS','SCX','FLG',
+  // Added v222 for SFO-area commercial coverage
+  'ABX','QXE','QXA','HZA','JIA','AAY','AMF','UCA','SCW','GTI','POE','EDV','VRD','AWI','ASH','COA','MXY',
+  'SWG','WEN','SEB','BLS','EIA','NFX'
+];
 var AL=new Set(AIRLINES);
 var CATS_GA=[2,3,8,9,10,12];
 var CATS_MAYBE=[4];
@@ -700,8 +1586,8 @@ function isGA(cs,cat){
   return true;
 }
 
-var APT={KSFO:{lat:37.621,lon:-122.379,n:'San Francisco Intl'},KJFK:{lat:40.641,lon:-73.778,n:'JFK Intl'},KLAX:{lat:33.943,lon:-118.408,n:'Los Angeles Intl'},KORD:{lat:41.974,lon:-87.907,n:'Chicago OHare'},KDEN:{lat:39.856,lon:-104.674,n:'Denver Intl'},KSEA:{lat:47.450,lon:-122.309,n:'Seattle-Tacoma'}};
-var airport='KSFO',radius=200;
+var APT={KSFO:{lat:37.62818,lon:-122.38487,n:'San Francisco Intl'},KJFK:{lat:40.641,lon:-73.778,n:'JFK Intl'},KLAX:{lat:33.943,lon:-118.408,n:'Los Angeles Intl'},KORD:{lat:41.974,lon:-87.907,n:'Chicago OHare'},KDEN:{lat:39.856,lon:-104.674,n:'Denver Intl'},KSEA:{lat:47.450,lon:-122.309,n:'Seattle-Tacoma'}};
+var airport='KSFO',radius=800;
 var leafMap,markers={},allAC=[],gaAC=[],trackHistory={},trackLines={},faMapSet={},identToMarkerId={};
 
 function buildFaMapSet(){
@@ -716,17 +1602,40 @@ function buildFaMapSet(){
       var f=arr[i];
       if(f.arrived){var at=f.arriveISO?new Date(f.arriveISO).getTime():0;if(at>0&&(now2-at)>300000)continue;}
       var info={type:'arr',ident:f.ident,callsign:f.callsign,acType:f.type,from:f.from,city:f.city,country:f.country,to:'KSFO',depart:f.depart,arrive:f.arrive,departISO:f.departISO,arriveISO:f.arriveISO};
-      if(f.ident){faMapSet[f.ident.toUpperCase()]=info;faMapSet[f.ident.toUpperCase().replace(/[^A-Z0-9]/g,'')]=info;}
-      if(f.callsign){faMapSet[f.callsign.toUpperCase()]=info;faMapSet[f.callsign.toUpperCase().replace(/[^A-Z0-9]/g,'')]=info;}
+      var fIdent=f.ident?String(f.ident).toUpperCase():'';
+      var fCall=f.callsign?String(f.callsign).toUpperCase():'';
+      if(fIdent){faMapSet[fIdent]=info;faMapSet[fIdent.replace(/[^A-Z0-9]/g,'')]=info;}
+      if(fCall){faMapSet[fCall]=info;faMapSet[fCall.replace(/[^A-Z0-9]/g,'')]=info;}
     }
     for(var i=0;i<dep.length;i++){
       var f=dep[i];
       if(f.departed){var dt=f.departISO?new Date(f.departISO).getTime():0;if(dt>0&&(now2-dt)>300000)continue;}
       var info2={type:'dep',ident:f.ident,callsign:f.callsign,acType:f.type,from:'KSFO',to:f.to,city:f.city,country:f.country,depart:f.depart,arrive:f.arrive,departISO:f.departISO,arriveISO:f.arriveISO};
-      if(f.ident&&!faMapSet[f.ident.toUpperCase()]){faMapSet[f.ident.toUpperCase()]=info2;faMapSet[f.ident.toUpperCase().replace(/-/g,'')]=info2;}
-      if(f.callsign&&!faMapSet[f.callsign.toUpperCase()]){faMapSet[f.callsign.toUpperCase()]=info2;faMapSet[f.callsign.toUpperCase().replace(/-/g,'')]=info2;}
+      var dIdent=f.ident?String(f.ident).toUpperCase():'';
+      var dCall=f.callsign?String(f.callsign).toUpperCase():'';
+      if(dIdent&&!faMapSet[dIdent]){faMapSet[dIdent]=info2;faMapSet[dIdent.replace(/-/g,'')]=info2;}
+      if(dCall&&!faMapSet[dCall]){faMapSet[dCall]=info2;faMapSet[dCall.replace(/-/g,'')]=info2;}
     }
   }).catch(function(){});
+}
+
+// Global error handler - log full stack trace for uncaught errors
+// This is critical for diagnosing intermittent crashes in production
+window.addEventListener('error',function(ev){
+  var stack=ev.error&&ev.error.stack?ev.error.stack:'';
+  console.error('[GLOBAL ERROR]',ev.message,'at',ev.filename+':'+ev.lineno+':'+ev.colno,stack);
+});
+window.addEventListener('unhandledrejection',function(ev){
+  var r=ev.reason;
+  var stack=r&&r.stack?r.stack:'';
+  console.error('[UNHANDLED PROMISE REJECTION]',r,stack);
+});
+// Defensive string helper - safe .replace that never crashes on undefined/null
+function safeStr(v){return (v==null||v===undefined)?'':String(v);}
+// HTML escape helper - use when injecting any API data into innerHTML
+// Prevents XSS if FA/OpenSky ever returns data with HTML/script injection
+function htmlEsc(v){
+  return safeStr(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 window.onload=function(){
@@ -735,11 +1644,123 @@ window.onload=function(){
   initMap();
   fetchBoards();
   buildFaMapSet();
-  // Delay first map refresh to let faMapSet populate
-  setTimeout(function(){buildFaMapSet();setTimeout(refresh,2000);},3000);
-  setInterval(refresh,10000);
+  // Delay initial refresh to let initMap's container-dimension polling complete
+  setTimeout(refresh,500);
+  setTimeout(function(){buildFaMapSet();refresh();},2500);
+  // Adaptive poll cadence: 10s when healthy, 30s when rate-limited.
+  // Reschedules itself each tick so we can change the delay on the fly without clearing interval.
+  window._refreshDelay=10000;
+  function scheduleRefresh(){
+    setTimeout(function(){
+      try{refresh();}catch(e){}
+      // Check current state set by refresh() and adapt delay
+      window._refreshDelay=window._osky429?30000:10000;
+      scheduleRefresh();
+    },window._refreshDelay);
+  }
+  scheduleRefresh();
   setInterval(fetchBoards,30000);
-  setInterval(buildFaMapSet,15000);
+  // Helicopter proximity scanner — runs every 15s but reads from shared allAC (no extra API cost)
+  scanInboundHelis();
+  setInterval(scanInboundHelis,15000);
+  // Credit tracker — polls /status every 20s normally, every 5s during backoff for live countdown.
+  // /status is a cheap local endpoint and does NOT cost OpenSky credits.
+  window._creditPollDelay=20000;
+  function scheduleCreditPoll(){
+    setTimeout(function(){
+      updateCreditStatus();
+      var s=window._creditStatus;
+      window._creditPollDelay=(s&&s.inBackoff)?5000:20000;
+      scheduleCreditPoll();
+    },window._creditPollDelay);
+  }
+  updateCreditStatus();
+  scheduleCreditPoll();
+  // Local 1-second ticker — re-renders the HUD each second using the anchored _backoffEndsAt timestamp.
+  // This makes the H:MM:SS countdown tick visibly every second between /status polls (and between
+  // the actual 60-second server-side backoff, which we decrement locally for live feel).
+  setInterval(function(){
+    if(window._creditStatus)renderCreditHUD();
+  },1000);
+  // 2-second updater: handles two transient row-cell states that need real-time OpenSky data:
+  //   (a) DEPARTED altitude readout in the ETA cell (.dep-eta) — climbing-out aircraft
+  //   (b) TAXIING indicator in the ETA cell (.arr-eta) — landed aircraft still moving on the ground
+  // Both pull from window.allAC (latest OpenSky snapshot) without spending API credits.
+  setInterval(function(){
+    if(!window.allAC)return;
+    // (a) departed altitude
+    var depCells=document.querySelectorAll('.dep-eta[data-tail]');
+    depCells.forEach(function(b){
+      var tail=b.dataset.tail||'';
+      var callsign=b.dataset.callsign||'';
+      var tailNorm=tail.replace(/[^A-Z0-9]/g,'');
+      var callsignNorm=callsign.replace(/[^A-Z0-9]/g,'');
+      for(var i=0;i<window.allAC.length;i++){
+        var ac=window.allAC[i];
+        var cs=(ac.cs||'').toUpperCase().replace(/ /g,'');
+        var hexId=(ac.id||'').toUpperCase();
+        // Same matching strategy as TAXIING below: fractionals broadcast ICAO callsign
+        // (EJA815) on ADS-B, not the FA tail (N815QS). Match either.
+        var matched = (cs && (cs===tail || cs===tailNorm || cs===callsign || cs===callsignNorm)) ||
+                      (hexId && hexId===tail);
+        if(matched){
+          var altEl=b.querySelector('.alt');
+          if(altEl){
+            var ftVal=ac.ft;
+            if(ftVal!=null&&ftVal>=0){
+              // Round to nearest 100ft for legibility ("3,400ft" not "3,427ft").
+              // Below 1000ft show the actual value (every foot matters during initial climb).
+              var formatted=ftVal>=1000?(Math.round(ftVal/100)*100).toLocaleString()+'ft':ftVal+'ft';
+              altEl.textContent=formatted;
+            } else {
+              // ac.ft is null — happens when the OpenSky entry has no barometric altitude
+              // (transponder fault, very low ground bounce, just-takeoff altitude not yet
+              // populated). Show a visible placeholder so staff knows we're tracking but
+              // waiting for altitude.
+              altEl.textContent='climbing…';
+            }
+          }
+          break;
+        }
+      }
+    });
+    // (b) arriving — flip LANDED/FINAL to TAXIING when on ground and moving slowly.
+    // The cell's original FA-rendered state (LANDED/FINAL/etc.) is preserved in dataset.original
+    // so we can revert when the plane stops or a new render replaces this cell.
+    var arrCells=document.querySelectorAll('.arr-eta[data-tail]');
+    arrCells.forEach(function(b){
+      var tail=b.dataset.tail||'';
+      var callsign=b.dataset.callsign||'';
+      var tailNorm=tail.replace(/[^A-Z0-9]/g,'');
+      var callsignNorm=callsign.replace(/[^A-Z0-9]/g,'');
+      // Cache the original FA-side text exactly once, so we can switch back when plane stops.
+      if(!b.dataset.original){b.dataset.original=b.textContent;}
+      for(var i=0;i<window.allAC.length;i++){
+        var ac=window.allAC[i];
+        var cs=(ac.cs||'').toUpperCase().replace(/ /g,'');
+        var hexId=(ac.id||'').toUpperCase();
+        // For fractionals, FA gives ident=tail (N260QS) and callsign=ICAO callsign (EJA260),
+        // while OpenSky's cs field contains the ICAO callsign. Match either.
+        var matched = (cs && (cs===tail || cs===tailNorm || cs===callsign || cs===callsignNorm)) ||
+                      (hexId && hexId===tail);
+        if(matched){
+          // TAXIING criteria: on the ground AND moving (>2kt to filter sensor noise) AND under 50kt.
+          // Below 2kt the plane is essentially stopped — revert to FA's original text.
+          if(ac.gnd && ac.kts>2 && ac.kts<50){
+            if(b.textContent!=='TAXIING'){
+              b.textContent='TAXIING';
+              b.style.color='#0891b2'; // cyan — distinct from green LANDED and amber FINAL
+            }
+          } else if(b.textContent==='TAXIING'){
+            // Plane stopped or speed unknown — revert to whatever FA rendered originally.
+            b.textContent=b.dataset.original;
+            b.style.color=b.dataset.original==='FINAL'?'var(--amber)':'var(--green)';
+          }
+          break;
+        }
+      }
+    });
+  },2000);
   // Spot click - inline dropdown
   document.addEventListener('click',function(e){
     var el=e.target.closest('.spot-click');
@@ -800,9 +1821,21 @@ window.onload=function(){
           var row=el.closest('.fr');
           if(row)row.style.display='none';
         } else {
-          if(!window._parkingAssignments)window._parkingAssignments={};
-          window._parkingAssignments[planeId]=newSpot;
-          el.innerHTML=newSpot;
+          // Route through assignSpot so we maintain the one-plane-per-spot invariant. The picker
+          // dropdown filtered occupied spots out before the click, so a conflict here means a
+          // race (another plane was assigned to this spot in the milliseconds between menu-open
+          // and click). In that case we refuse and toast.
+          var ok = assignSpot(planeId, newSpot, false);
+          if(!ok){
+            // Find current occupant for the toast message
+            var occId = '';
+            for(var pa in window._parkingAssignments){
+              if(window._parkingAssignments[pa]===newSpot){occId=pa;break;}
+            }
+            showSpotConflictToast(newSpot, occId||'another plane');
+          } else {
+            el.innerHTML=newSpot;
+          }
         }
         dd.remove();
       });
@@ -815,80 +1848,286 @@ window.onload=function(){
     },10);
   });
   // Hover delegation for tail number zoom-to-map
-  var hoverTimer=null;
+  // Use mouseenter/mouseleave semantics via pointer target tracking
+  // to avoid the child-element re-fire bug with mouseover/mouseout
+  var zoomTimer=null,resetTimer=null,currentHoverEl=null;
   document.addEventListener('mouseover',function(e){
     var el=e.target.closest('.zp');
-    if(el&&el.dataset.zp){
-      clearTimeout(hoverTimer);
-      hoverTimer=setTimeout(function(){zoomToPlane(el.dataset.zp);},200);
-    }
+    if(!el||!el.dataset.zp)return;
+    // Ignore re-entries within the same .zp element (from child-to-child transitions)
+    if(currentHoverEl===el)return;
+    currentHoverEl=el;
+    // Cancel any pending reset - we're on a new hover
+    if(resetTimer){clearTimeout(resetTimer);resetTimer=null;}
+    if(zoomTimer){clearTimeout(zoomTimer);zoomTimer=null;}
+    var ident=el.dataset.zp;
+    zoomTimer=setTimeout(function(){
+      zoomTimer=null;
+      zoomToPlane(ident);
+    },180);
   });
   document.addEventListener('mouseout',function(e){
     var el=e.target.closest('.zp');
-    if(el&&el.dataset.zp){
-      clearTimeout(hoverTimer);
-      hoverTimer=setTimeout(function(){resetMapView();},500);
-    }
+    if(!el||!el.dataset.zp)return;
+    // relatedTarget is where the mouse is moving TO
+    // If moving to another element still inside this .zp, ignore (not a real leave)
+    var to=e.relatedTarget;
+    if(to&&el.contains(to))return;
+    // Actual leave - cancel any pending zoom and schedule reset
+    if(zoomTimer){clearTimeout(zoomTimer);zoomTimer=null;}
+    if(resetTimer){clearTimeout(resetTimer);}
+    currentHoverEl=null;
+    resetTimer=setTimeout(function(){
+      resetTimer=null;
+      resetMapView();
+    },400);
   });
   // Click still works for immediate zoom
   document.addEventListener('click',function(e){
     var el=e.target.closest('.zp');
-    if(el&&el.dataset.zp){e.stopPropagation();zoomToPlane(el.dataset.zp);}
+    if(el&&el.dataset.zp){
+      e.stopPropagation();
+      // Cancel any pending hover timers so the click wins
+      if(zoomTimer){clearTimeout(zoomTimer);zoomTimer=null;}
+      if(resetTimer){clearTimeout(resetTimer);resetTimer=null;}
+      zoomToPlane(el.dataset.zp);
+    }
   });
 
   setInterval(buildFaMapSet,30000);
   setInterval(function(){document.getElementById('ck').textContent=new Date().toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false})},1000);
 };
 
-function getAP(){return APT[airport]||{lat:37.621,lon:-122.379,n:airport};}
+function getAP(){return APT[airport]||{lat:37.62818,lon:-122.38487,n:airport};}
 function doCenter(){var a=getAP();leafMap.setView([a.lat,a.lon],10);}
 function doRefresh(){refresh();}
 
 function initMap(){
   var a=getAP();
-  leafMap=L.map('map',{center:[a.lat,a.lon],zoom:7,zoomControl:false,attributionControl:false});
-  
-  // Base map: CartoDB Voyager - blue ocean, terrain hints, city labels
-  window._tileLayer=L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18}).addTo(leafMap);
-  window._darkTileUrl='https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
-  window._lightTileUrl='https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
-  // Weather radar overlay from RainViewer (free, no API key)
-  window._radarLayer=null;
-  function loadRadar(){
-    fetch('https://api.rainviewer.com/public/weather-maps.json')
-    .then(function(r){return r.json();})
-    .then(function(d){
-      if(d&&d.radar&&d.radar.past&&d.radar.past.length>0){
-        var latest=d.radar.past[d.radar.past.length-1].path;
-        if(window._radarLayer)leafMap.removeLayer(window._radarLayer);
-        window._radarLayer=L.tileLayer('https://tilecache.rainviewer.com'+latest+'/256/{z}/{x}/{y}/6/1_1.png',{opacity:0.2,maxZoom:18,zIndex:10}).addTo(leafMap);
-      }
-    }).catch(function(e){console.log('Radar fetch error:',e);});
+  var mapEl=document.getElementById('map');
+  if(!mapEl){
+    console.warn('[MAP] #map element missing, retrying');
+    setTimeout(initMap,200);return;
   }
-  loadRadar();
-  // 3D view button
-  var btn3d=L.DomUtil.create('div');
-  btn3d.innerHTML='<button onclick="show3D()" style="font-family:var(--mono);font-size:10px;font-weight:700;color:#fff;background:rgba(59,130,246,.8);border:1px solid rgba(59,130,246,.4);border-radius:6px;padding:5px 10px;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3)">🌐 3D View</button>';
-  btn3d.style.cssText='position:absolute;bottom:12px;left:12px;z-index:1000';
-  document.getElementById('map').appendChild(btn3d);
-  setInterval(loadRadar,300000); // refresh radar every 5 min
-  // Lightning overlay from Blitzortung
-  window._lightningLayer=L.tileLayer('https://map.blitzortung.org/GETlightning.php?&north={n}&south={s}&east={e}&west={w}&z={z}&x={x}&y={y}',{opacity:0.7,maxZoom:18,zIndex:11,attribution:''});
-  // Use simpler lightning tile approach
-  window._lightningLayer=L.tileLayer('https://tiles.blitzortung.org/strikes/1/{z}/{x}/{y}.png',{opacity:0.3,maxZoom:18,zIndex:11}).addTo(leafMap);
-  // KSFO marker
-  var sfoIcon=L.divIcon({className:'',html:'<div style="width:8px;height:8px;background:#1e3a5f;border:2px solid #fff;border-radius:50%;box-shadow:0 0 6px rgba(30,58,95,.4)"></div>',iconSize:[8,8],iconAnchor:[4,4]});
+  // Wait for container dimensions - use exponential backoff with cap (20 tries = ~4sec)
+  if(!window._initMapTries)window._initMapTries=0;
+  if(mapEl.clientHeight===0||mapEl.clientWidth===0){
+    window._initMapTries++;
+    if(window._initMapTries>30){
+      console.error('[MAP] Container never got dimensions after 30 tries. Forcing init with fallback size.');
+      // Force a size
+      mapEl.style.height=mapEl.style.height||'260px';
+      mapEl.style.minHeight='260px';
+    } else {
+      console.log('[MAP] Container not ready (try '+window._initMapTries+'), retrying in 150ms');
+      setTimeout(initMap,150);return;
+    }
+  }
+  window._initMapTries=0;
+  // Guard against double-init if called twice
+  if(window._mapInitialized){
+    console.log('[MAP] Already initialized, invalidating size only');
+    if(leafMap)leafMap.invalidateSize(true);
+    return;
+  }
+  window._mapInitialized=true;
+  try{
+    leafMap=L.map('map',{center:[a.lat,a.lon],zoom:9,zoomControl:false,attributionControl:false,minZoom:3,maxZoom:19,worldCopyJump:true,preferCanvas:false});
+  }catch(e){
+    console.error('[MAP] Failed to create Leaflet map:',e);
+    window._mapInitialized=false;
+    setTimeout(initMap,500);return;
+  }
+  window.leafMap=leafMap;
+  // Aggressive invalidateSize schedule - catches late layout changes
+  [50,250,500,1000,1500,2500,4000].forEach(function(ms){
+    setTimeout(function(){if(leafMap)try{leafMap.invalidateSize(true);}catch(e){}},ms);
+  });
+  window.addEventListener('resize',function(){if(leafMap)setTimeout(function(){try{leafMap.invalidateSize(true);}catch(e){}},100);});
+  // ResizeObserver on the map container catches panel size changes (resize bar drag, etc.)
+  // CRITICAL: must be debounced. Without debouncing, a window-resize drag can fire dozens of
+  // resize events per second, each triggering invalidateSize() which re-issues tile requests.
+  // The thrash can leave Leaflet in a state where tiles are requested but the layer's internal
+  // bookkeeping is out of sync, resulting in visible tiles being orphaned (the "land layer drops
+  // out" bug). 200ms debounce is short enough to feel instant but long enough to coalesce
+  // a sustained drag into a single invalidateSize call.
+  if(window.ResizeObserver){
+    try{
+      var roTimer=null;
+      var ro=new ResizeObserver(function(){
+        if(roTimer)clearTimeout(roTimer);
+        roTimer=setTimeout(function(){
+          roTimer=null;
+          if(leafMap)try{leafMap.invalidateSize(true);}catch(e){}
+        },200);
+      });
+      ro.observe(mapEl);
+      if(mapEl.parentElement)ro.observe(mapEl.parentElement);
+    }catch(e){console.warn('[MAP] ResizeObserver failed:',e);}
+  }
+  // IntersectionObserver: invalidate when map becomes visible
+  if(window.IntersectionObserver){
+    try{
+      var io=new IntersectionObserver(function(entries){
+        entries.forEach(function(en){if(en.isIntersecting&&leafMap)try{leafMap.invalidateSize(true);}catch(e){}});
+      });
+      io.observe(mapEl);
+    }catch(e){}
+  }
+  // Dark aviation-style tile strategy — modeled on FlightAware's look.
+  // Order: CARTO dark first (best aesthetic), then ESRI dark gray, then CARTO voyager (light fallback),
+  // then OSM as last-resort. This way if CARTO is blocked (corporate network), we still degrade
+  // gracefully without losing the map entirely.
+  //
+  // Robustness model (rebuilt v232 to fix recurrent "land layer drops out" bug):
+  //   1. Each provider gets 10s to load its FIRST tile before we consider it failed.
+  //      Was 6s, which raced with the actual network — providers that took 7s to wake up
+  //      were getting swapped out the moment they were about to succeed, leaving us in
+  //      "transitioning" state with no working tile layer.
+  //   2. Errors only trigger a swap if we get >=8 errors AND <2 successful loads in 15s.
+  //      Was 5/0 within unbounded time — transient CDN hiccups (e.g. one 503 every 30s)
+  //      slowly accumulated past the threshold and triggered a swap of a healthy provider.
+  //   3. When all providers fail, we wrap-around back to index 0 after a 30s cooldown.
+  //      Was a hard return — if all 4 providers had a transient failure window, the map
+  //      would PERMANENTLY have no tiles even after the network came back.
+  //   4. The periodic health check now confirms "no tiles" across 2 consecutive 5s checks
+  //      before nudging redraw, so it doesn't race during normal pan/zoom transitions.
+  var tileProviders=[
+    {name:'CARTO-Dark',url:'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',sub:'abcd',theme:'dark'},
+    {name:'ESRI-DarkGray',url:'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',sub:null,theme:'dark'},
+    {name:'CARTO-Voyager',url:'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png',sub:'abcd',theme:'light'},
+    {name:'OSM',url:'https://tile.openstreetmap.org/{z}/{x}/{y}.png',sub:null,theme:'light'}
+  ];
+  // Dark gray tile substitute — when a single tile fails, this fills the cell with a dark
+  // gray solid that matches the dark theme background, instead of a transparent void.
+  // Also helps catch the issue visually if many tiles are erroring (you'd see uniform gray
+  // tile grid instead of pure black map).
+  var DARK_ERROR_TILE='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+  var currentProviderIdx=0;
+  var providerCycle=0; // increments each full cycle through all providers; used for cooldown
+  function swapTileProvider(idx){
+    // Wrap-around: if we've exhausted all providers, cycle back to 0 after a 30s cooldown.
+    // This prevents the "permanent dead map" failure mode when a network blip hits every provider.
+    if(idx>=tileProviders.length){
+      providerCycle++;
+      if(providerCycle>=3){
+        console.error('[MAP] All tile providers exhausted '+providerCycle+' times — giving up on swaps. Will rely on 30s health check to retry.');
+        return;
+      }
+      console.warn('[MAP] All tile providers tried — wrapping around to provider 0 after 30s cooldown (cycle '+providerCycle+')');
+      setTimeout(function(){swapTileProvider(0);},30000);
+      return;
+    }
+    currentProviderIdx=idx;
+    var p=tileProviders[idx];
+    console.log('[MAP] Using tile provider:',p.name,'('+p.theme+')','cycle='+providerCycle);
+    // Track current theme globally so plane icons know whether to render for dark or light base.
+    window._mapTheme = p.theme;
+    var mapEl=document.getElementById('map');
+    if(mapEl){
+      mapEl.style.background = (p.theme==='dark') ? '#0b1d2a' : '#e8eaed';
+    }
+    if(window._updateMapThemeElements)window._updateMapThemeElements(p.theme);
+    var opts={
+      maxZoom:19,maxNativeZoom:19,minZoom:2,tileSize:256,
+      attribution:'',crossOrigin:'anonymous',keepBuffer:4,updateWhenIdle:false,
+      errorTileUrl:DARK_ERROR_TILE
+    };
+    if(p.sub)opts.subdomains=p.sub;
+    // Create the new layer FIRST, then remove the old one once new tiles start loading.
+    // This avoids the "blank moment" where we have no layer at all between provider swaps.
+    var newLayer=L.tileLayer(p.url,opts);
+    var loadedCount=0,errorCount=0,startedAt=Date.now(),hasSwappedFromError=false;
+    var oldLayer=window._tileLayer;
+    newLayer.on('tileload',function(){
+      loadedCount++;
+      // First successful load — now safe to remove the previous layer
+      if(loadedCount===1 && oldLayer){
+        try{leafMap.removeLayer(oldLayer);}catch(e){}
+        oldLayer=null;
+      }
+      // Once we've loaded 10 tiles successfully, this provider is LOCKED IN for the session.
+      // No watchdog or health check will swap us off it. This is the key fix that prevents the
+      // "map keeps switching between dark and light" bouncing the user reported.
+      if(loadedCount===10){
+        window._mapProviderLocked=true;
+        console.log('[MAP] Provider locked in:',p.name,'(10 successful tile loads)');
+      }
+    });
+    newLayer.on('tileerror',function(){
+      errorCount++;
+      // Only swap on persistent errors during the INITIAL load period: many errors AND zero
+      // successful loads within 20s. Once we've had ANY successful load, never swap from errors —
+      // those are just individual tile 404s on the edge of the bbox or transient blips.
+      var elapsedSec=(Date.now()-startedAt)/1000;
+      if(!hasSwappedFromError && errorCount>=10 && loadedCount===0 && elapsedSec<=20){
+        hasSwappedFromError=true;
+        console.warn('[MAP]',p.name,'persistent errors with no loads (errors='+errorCount+' in '+elapsedSec.toFixed(1)+'s) — swapping');
+        swapTileProvider(idx+1);
+      }
+    });
+    newLayer.addTo(leafMap);
+    window._tileLayer=newLayer;
+    // Initial-load watchdog: if NO tiles load within 20s (was 10s), the provider is dead.
+    // 20s is generous — corporate networks and CDN cold-starts can take 10-15s legitimately.
+    // This only fires for the first-ever load; once we have ANY tile, we trust the provider.
+    setTimeout(function(){
+      if(loadedCount===0 && currentProviderIdx===idx && !hasSwappedFromError){
+        console.warn('[MAP]',p.name,'loaded 0 tiles in 20s — swapping');
+        hasSwappedFromError=true;
+        swapTileProvider(idx+1);
+      }
+    },20000);
+  }
+  swapTileProvider(0);
+  // Health check — passive only. Used to log when tiles disappear, but NEVER auto-swaps providers
+  // once one is locked in. The previous version of this code aggressively swapped providers on
+  // any "no visible tiles" condition, which caused the map to bounce between dark and light tile
+  // sources whenever the browser was zooming, panning, or the network briefly hiccupped.
+  // Now: once locked, we only attempt a redraw on ourselves — never swap.
+  window._mapNoTilesStreak=0;
+  setInterval(function(){
+    if(!leafMap||!window._tileLayer)return;
+    var mapContainer=document.getElementById('map');
+    if(!mapContainer)return;
+    var rect=mapContainer.getBoundingClientRect();
+    if(rect.width<10||rect.height<10){window._mapNoTilesStreak=0;return;}
+    var loadedTiles=mapContainer.querySelectorAll('.leaflet-tile-loaded').length;
+    if(loadedTiles===0){
+      window._mapNoTilesStreak++;
+      // After 4 consecutive checks (20s) of zero tiles, force a redraw of the CURRENT layer.
+      // We do NOT swap providers here — that was the bug causing the user-reported bouncing.
+      if(window._mapNoTilesStreak>=4){
+        console.log('[MAP health] No tiles for 20s — forcing redraw on current provider');
+        window._mapNoTilesStreak=0;
+        try{leafMap.invalidateSize(true);window._tileLayer.redraw();}catch(e){console.error('[MAP] redraw failed:',e);}
+      }
+    } else {
+      window._mapNoTilesStreak=0;
+    }
+  },5000);
+  window._radarLayer=null;
+  // Bottom toolbar
+  var toolbar=L.DomUtil.create('div');
+  toolbar.innerHTML='<button onclick="show3D()" class="map-tb-btn" style="background:rgba(59,130,246,.9);border-color:rgba(59,130,246,.5)" title="3D View">🌐</button>'+
+    '<button onclick="showRampView()" class="map-tb-btn" style="background:rgba(245,158,11,.9);border-color:rgba(245,158,11,.5)" title="Ramp View">🗺</button>'+
+    '<button onclick="showShiftReport()" class="map-tb-btn" style="background:rgba(34,197,94,.9);border-color:rgba(34,197,94,.5)" title="Shift Report">📋</button>';
+  toolbar.style.cssText='position:absolute;bottom:10px;left:10px;z-index:1000;display:flex;flex-direction:column;gap:5px;padding:5px;background:rgba(255,255,255,.95);border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.12);backdrop-filter:blur(10px);border:1px solid rgba(0,0,0,.05)';
+  document.getElementById('map').appendChild(toolbar);
+  // KSFO marker: bright white center with dark ring, visible on both dark and light maps.
+  var sfoIcon=L.divIcon({className:'',html:'<div style="width:10px;height:10px;background:#fff;border:2px solid #1e3a5f;border-radius:50%;box-shadow:0 0 8px rgba(255,255,255,.6),0 0 12px rgba(30,58,95,.5)"></div>',iconSize:[10,10],iconAnchor:[5,5]});
   L.marker([a.lat,a.lon],{icon:sfoIcon,interactive:false}).addTo(leafMap);
-  // Range rings - clean, minimal
+  // Range rings — a bit brighter so they read on dark without being noisy on light
   var rings=[5,20,50];
-  var ringColors=['rgba(100,116,139,.2)','rgba(100,116,139,.15)','rgba(100,116,139,.1)'];
-  var ringWeights=[0.6,0.5,0.5];
+  var ringColors=['rgba(148,163,184,.35)','rgba(148,163,184,.25)','rgba(148,163,184,.15)'];
+  var ringWeights=[0.7,0.6,0.5];
   for(var r=0;r<rings.length;r++){
     L.circle([a.lat,a.lon],{radius:rings[r]*1852,color:ringColors[r],fillColor:'transparent',fillOpacity:0,weight:ringWeights[r],opacity:1,dashArray:'4,6'}).addTo(leafMap);
     var labelLat=a.lat+(rings[r]/60);
-    var labelIcon=L.divIcon({className:'',html:'<span style="font-family:var(--mono);font-size:7px;font-weight:600;color:rgba(148,163,184,.5);padding:0 2px">'+rings[r]+'</span>',iconSize:[20,10],iconAnchor:[10,5]});
+    var labelIcon=L.divIcon({className:'ringlabel',html:'<span style="font-family:var(--mono);font-size:7px;font-weight:600;color:rgba(203,213,225,.7);padding:0 2px;text-shadow:0 0 3px rgba(0,0,0,.7)">'+rings[r]+'</span>',iconSize:[20,10],iconAnchor:[10,5]});
     L.marker([labelLat,a.lon],{icon:labelIcon,interactive:false}).addTo(leafMap);
   }
+  console.log('[MAP] Initialization complete');
 }
 
 function bbox(){
@@ -898,10 +2137,31 @@ function bbox(){
 
 function refresh(){
   var b=bbox();
-  fetch('/osky/states/all?extended=1&lamin='+b.la1+'&lomin='+b.lo1+'&lamax='+b.la2+'&lomax='+b.lo2)
-  .then(function(r){if(!r.ok)throw new Error(r.status);return r.json();})
+  fetch('/osky/states/all?extended=1&lamin='+b.la1+'&lomin='+b.lo1+'&lamax='+b.la2+'&lomax='+b.lo2,{cache:'no-cache'})
+  .then(function(r){
+    // Surface rate-limit state to user without throwing (so markers persist)
+    if(r.status===429){
+      window._osky429=true;
+      // Show countdown if we know it from the status endpoint
+      var cs=window._creditStatus;
+      var label='RATE LIMITED';
+      if(cs&&cs.backoffSecondsRemaining>0)label='RATE LIMIT '+cs.backoffSecondsRemaining+'s';
+      setPill('err',label);
+      return null;
+    }
+    window._osky429=false;
+    if(!r.ok)throw new Error(r.status);
+    return r.json();
+  })
   .then(function(d){
-    if(!d.states||!d.states.length){setPill('err','NO DATA');return;}
+    if(!d)return; // 429 path - keep existing markers, don't process
+    if(!d.states||!d.states.length){
+      // Empty response — DON'T blank the map. Keep existing markers from prior successful fetches.
+      // Only update status if we've never had data
+      if(!window._haveHadData)setPill('err','NO DATA');
+      return;
+    }
+    window._haveHadData=true;
     allAC=[];
     for(var i=0;i<d.states.length;i++){
       var s=d.states[i];
@@ -910,57 +2170,132 @@ function refresh(){
         kts:s[9]!=null?Math.round(s[9]*1.94384):null,
         fpm:s[11]!=null?Math.round(s[11]*196.85):null});
     }
-    drawMap(allAC);
-    drawHUD();
+    try{drawMap(allAC);}catch(eMap){console.error('[drawMap crash]',eMap,eMap.stack);}
+    try{drawHUD();}catch(eHud){console.error('[drawHUD crash]',eHud,eHud.stack);}
+    window.allAC=allAC;
     setPill('live','LIVE');
     document.getElementById('fo').className='fd on';
-    document.getElementById('fadsb').className='fd on';
   })
   .catch(function(e){
-    console.error('Fetch error:',e);
-    setPill('err','ERROR: '+e.message);
+    console.error('[refresh fetch error]',e,e&&e.stack);
+    // Keep existing markers visible on transient errors — don't blank
+    setPill('err','ERROR: '+(e&&e.message?e.message:e));
     document.getElementById('fo').className='fd off';
   });
 }
 
 function drawMap(ac){
+  if(!leafMap){console.log('[MAP] drawMap called before map ready, deferring');setTimeout(function(){drawMap(ac);},200);return;}
   var fmKeys=Object.keys(faMapSet);
   console.log('[MAP] faMapSet keys:',fmKeys.length,'aircraft from OpenSky:',ac.length);
-  if(fmKeys.length===0){console.log('[MAP] faMapSet empty, skipping');return;}
-  if(fmKeys.length<20)console.log('[MAP] faMapSet sample:',fmKeys.slice(0,10).join(', '));
+  // Don't early-return when faMapSet is empty — fallback filter can still show nearby planes.
+  if(fmKeys.length>0&&fmKeys.length<20)console.log('[MAP] faMapSet sample:',fmKeys.slice(0,10).join(', '));
   
+  var apt=getAP();
+  var sfoLat=apt.lat,sfoLon=apt.lon;
+  var now=Date.now();
+  // Map filter: ONLY show planes that FA has confirmed as current arrivals to KSFO.
+  // The map's job is to visualize the En Route board on the left — nothing more, nothing less.
+  // Earlier versions had an "approach-profile fallback" that tried to catch GA aircraft FA hadn't
+  // identified yet by inferring landing intent from altitude/speed/heading. In practice this
+  // generated far more false positives (local pattern work, departures climbing out, transit
+  // traffic) than it caught real FA-misses. The user's authoritative source is the En Route
+  // table; the map mirrors that table.
+  //
+  // A plane appears on the map iff:
+  //   - OpenSky has a position for it (lat/lon present)
+  //   - It's airborne (not on ground)
+  //   - Its callsign is in faMapSet AS AN ARRIVAL ('arr'), not as a departure
+  // Departures from SFO and unrelated transit traffic are rejected.
   var filtered=ac.filter(function(a){
     if(a.lat==null||a.lon==null)return false;
+    if(a.gnd)return false;
     var cs=(a.cs||'').toUpperCase().replace(/ /g,'');
-    if(cs&&faMapSet[cs])return true;
-    return false;
+    if(!cs)return false;
+    var fi=faMapSet[cs];
+    if(!fi)return false;
+    if(fi.type!=='arr')return false; // explicitly reject departures even though they might be in faMapSet
+    return true;
   });
   console.log('[MAP] matched:',filtered.length);
 
   var cur={};
   for(var i=0;i<filtered.length;i++)cur[filtered[i].id]=true;
-  for(var k in markers){if(!cur[k]){leafMap.removeLayer(markers[k]);delete markers[k];if(trackLines[k]){leafMap.removeLayer(trackLines[k]);delete trackLines[k];}delete trackHistory[k];}}
+  // Preserve markers across transient empty filters. Only remove a marker if either:
+  //   (a) it's been missing from the filter for 2+ consecutive refreshes, OR
+  //   (b) we have a healthy current filter result (>=1 plane), confirming this isn't a bad cycle.
+  // This prevents the map from blanking during 429 backoff or one-off bad FA data.
+  if(!window._missingCounts)window._missingCounts={};
+  for(var k in markers){
+    if(!cur[k]){
+      window._missingCounts[k]=(window._missingCounts[k]||0)+1;
+      // Require 2+ consecutive misses AND a healthy filter this cycle to remove
+      if(window._missingCounts[k]>=2&&filtered.length>0){
+        leafMap.removeLayer(markers[k]);
+        delete markers[k];
+        if(trackLines[k]){leafMap.removeLayer(trackLines[k]);delete trackLines[k];}
+        delete trackHistory[k];
+        delete window._missingCounts[k];
+      }
+    } else {
+      delete window._missingCounts[k]; // reset counter on seen
+    }
+  }
+  // Rebuild identToMarkerId from scratch on every draw so it never contains stale marker refs
+  // Build into a new local map, then swap atomically at the end to avoid a race where
+  // zoomToPlane reads an empty identToMarkerId during a rebuild.
+  var nextIdentMap={};
   for(var i=0;i<filtered.length;i++){
+    try{
     var a=filtered[i];
     var h=a.trk||0,alt=a.ft||0;
     var cs=a.cs||a.id;
     var fi=faMapSet[(cs||'').toUpperCase().replace(/ /g,'')];
     var faType=fi?fi.type:'';
-    var col=faType==='arr'?'#f59e0b':(faType==='dep'?'#dc2626':'#64748b');
+    // Theme-aware colors. On dark base: brighter saturated colors for visibility.
+    // On light base: original colors. Fallback (unmatched GA) gets cyan on dark, grey on light.
+    var _isDark = window._mapTheme === 'dark';
+    var col;
+    if(faType==='arr') col = _isDark ? '#fbbf24' : '#f59e0b';       // amber — incoming
+    else if(faType==='dep') col = _isDark ? '#f87171' : '#dc2626';  // red — departing
+    else col = _isDark ? '#67e8f9' : '#64748b';                     // cyan on dark / grey on light — unmatched GA
     var sz=a.gnd?22:32;
-    var path='M12 1.5C12.4 1.5 12.7 2.5 12.8 4L13 7.5L19.5 11.5C20 11.8 20 12.2 19.5 12.5L13 11L13.2 18L15.5 20C15.8 20.2 15.8 20.6 15.5 20.8L12 19.5L8.5 20.8C8.2 20.6 8.2 20.2 8.5 20L10.8 18L11 11L4.5 12.5C4 12.2 4 11.8 4.5 11.5L11 7.5L11.2 4C11.3 2.5 11.6 1.5 12 1.5Z';
-    // Label: tail + altitude/speed
-    var label=cs;
+    var acTypeForIcon=fi&&fi.acType?fi.acType:'';
+    // Icon outline: white on dark base (so silhouette pops), or white on light (existing behavior,
+    // because the drop-shadow handles contrast there).
+    var iconStroke = _isDark ? '#0f172a' : '#fff';
+    var iconSvg=svgIcon(acTypeForIcon,Math.round(h),col,sz,iconStroke);
+    // Label hierarchy for the map. Goal: the user scanning the IDENT column on the dashboard
+    // (which lists tail numbers like N944QS) should be able to spot the same tail on the map at
+    // a glance. Previously the label was the OpenSky callsign (EJA944 for a NetJets fractional),
+    // which doesn't appear anywhere in the dashboard table — so visual correlation was impossible.
+    //   Primary line: tail from FA (fi.ident), bold + larger + amber for arrivals
+    //   Secondary line: callsign in dim grey, only if it differs from the tail, plus alt/speed
+    var primaryLabel = (fi && fi.ident) ? safeStr(fi.ident).toUpperCase() : (cs || '?');
     var altSpd='';
     if(!a.gnd&&alt>0)altSpd=(alt>=1000?Math.round(alt/100)+'00':''+alt)+'ft '+(a.kts||0)+'kt';
-    var icon=L.divIcon({className:'',html:'<div style="position:relative"><svg width="'+sz+'" height="'+sz+'" viewBox="0 0 24 24" style="transform:rotate('+Math.round(h)+'deg);filter:drop-shadow(0 1px 2px rgba(0,0,0,.2))"><path d="'+path+'" fill="'+col+'" stroke="#fff" stroke-width="1.2" stroke-linejoin="round"/></svg><div style="position:absolute;left:'+(sz+3)+'px;top:-3px;white-space:nowrap"><div style="font-family:JetBrains Mono,monospace;font-size:9px;font-weight:800;color:'+col+';text-shadow:-1px 0 2px #fff,1px 0 2px #fff,0 -1px 2px #fff,0 1px 2px #fff;line-height:1.1">'+label+'</div>'+(altSpd?'<div style="font-family:JetBrains Mono,monospace;font-size:7px;font-weight:600;color:#64748b;text-shadow:-1px 0 1px #fff,1px 0 1px #fff;line-height:1.1">'+altSpd+'</div>':'')+'</div></div>',iconSize:[sz+90,sz+10],iconAnchor:[sz/2,sz/2]});
+    // Build the secondary line: callsign (if different from tail) followed by alt/speed.
+    // For unmatched GA where tail==cs, just show alt/speed. For fractionals, show callsign.
+    var subParts=[];
+    if(cs && cs.toUpperCase() !== primaryLabel) subParts.push(cs.toUpperCase());
+    if(altSpd) subParts.push(altSpd);
+    var subLine=subParts.join(' · ');
+    // Text shadow flips with theme: dark halo on dark base (so bright label pops), light halo on light
+    var _shadowColor = _isDark ? '#000' : '#fff';
+    var _shadow = '-1px 0 2px '+_shadowColor+',1px 0 2px '+_shadowColor+',0 -1px 2px '+_shadowColor+',0 1px 2px '+_shadowColor;
+    var _shadowSmall = '-1px 0 1px '+_shadowColor+',1px 0 1px '+_shadowColor;
+    var _subColor = _isDark ? '#cbd5e1' : '#64748b';
+    // Primary tail label is 12px bold (was 9px). It's the dominant on-map text now so the user
+    // can read tails from across the screen and match them against the IDENT column.
+    var icon=L.divIcon({className:'',html:'<div style="position:relative">'+iconSvg+'<div style="position:absolute;left:'+(sz+3)+'px;top:-3px;white-space:nowrap"><div style="font-family:JetBrains Mono,monospace;font-size:12px;font-weight:800;color:'+col+';text-shadow:'+_shadow+';line-height:1.1;letter-spacing:.3px">'+primaryLabel+'</div>'+(subLine?'<div style="font-family:JetBrains Mono,monospace;font-size:8px;font-weight:600;color:'+_subColor+';text-shadow:'+_shadowSmall+';line-height:1.15;margin-top:1px">'+subLine+'</div>':'')+'</div></div>',iconSize:[sz+90,sz+10],iconAnchor:[sz/2,sz/2]});
     // Track line
     if(!trackHistory[a.id])trackHistory[a.id]=[];
     var th=trackHistory[a.id];
     if(th.length===0||th[th.length-1][0]!==a.lat||th[th.length-1][1]!==a.lon){th.push([a.lat,a.lon]);if(th.length>60)th.shift();}
     if(th.length>1&&!a.gnd){
+      var _trackOpacity = _isDark ? 0.65 : 0.4;
       if(trackLines[a.id])trackLines[a.id].setLatLngs(th);
-      else trackLines[a.id]=L.polyline(th,{color:col,weight:2,opacity:.4,dashArray:'6,4'}).addTo(leafMap);
+      else trackLines[a.id]=L.polyline(th,{color:col,weight:2,opacity:_trackOpacity,dashArray:'6,4'}).addTo(leafMap);
     }
     // Rich popup
     var popParts='<div style="font-family:monospace;font-size:9px;line-height:1.5;padding:2px">';
@@ -974,51 +2309,75 @@ function drawMap(ac){
     if(markers[a.id]){markers[a.id].setLatLng([a.lat,a.lon]);markers[a.id].setIcon(icon);markers[a.id].setPopupContent(popParts);}
     else{markers[a.id]=L.marker([a.lat,a.lon],{icon:icon}).addTo(leafMap).bindPopup(popParts);}
     // Map callsign/ident to marker ID for click-to-zoom
-    var csUp=(a.cs||'').toUpperCase().replace(/ /g,'');
-    if(csUp)identToMarkerId[csUp]=a.id;
-    if(fi&&fi.ident)identToMarkerId[fi.ident.toUpperCase().replace(/[^A-Z0-9]/g,'')]=a.id;
-    if(fi&&fi.callsign)identToMarkerId[fi.callsign.toUpperCase().replace(/[^A-Z0-9]/g,'')]=a.id;
-    if(fi&&fi.registration)identToMarkerId[fi.registration.toUpperCase().replace(/[^A-Z0-9]/g,'')]=a.id;
-    // Also map without dashes
-    if(csUp)identToMarkerId[csUp.replace(/-/g,'')]=a.id;
+    // NOTE: fi.ident, fi.callsign, fi.registration may be numbers or non-strings from FA JSON, so force String()
+    var csUp=safeStr(a.cs).toUpperCase().replace(/ /g,'');
+    if(csUp)nextIdentMap[csUp]=a.id;
+    if(fi&&fi.ident)nextIdentMap[safeStr(fi.ident).toUpperCase().replace(/[^A-Z0-9]/g,'')]=a.id;
+    if(fi&&fi.callsign)nextIdentMap[safeStr(fi.callsign).toUpperCase().replace(/[^A-Z0-9]/g,'')]=a.id;
+    if(fi&&fi.registration)nextIdentMap[safeStr(fi.registration).toUpperCase().replace(/[^A-Z0-9]/g,'')]=a.id;
+    if(csUp)nextIdentMap[csUp.replace(/-/g,'')]=a.id;
+    }catch(ePlane){console.error('[drawMap plane crash]',filtered[i]&&filtered[i].id,ePlane,ePlane.stack);}
   }
+  // Atomic swap: replace the global map in one assignment so zoomToPlane never sees a half-built state
+  identToMarkerId=nextIdentMap;
 }
 function zoomToPlane(ident){
-  if(!ident)return;
+  if(!ident||!leafMap)return;
   var key=ident.toUpperCase().replace(/[^A-Z0-9]/g,'');
-  var mid=identToMarkerId[key];
-  if(!mid){
-    // Try without leading N for US registrations
-    var noN=key.replace(/^N/,'');
-    if(noN&&identToMarkerId[noN])mid=identToMarkerId[noN];
+  // Helper: resolve mid to an actual alive marker or null
+  function resolveMarker(idMap){
+    if(!idMap)return null;
+    if(markers[idMap]&&markers[idMap].getLatLng)return markers[idMap];
+    return null;
   }
-  if(!mid){
-    // Try numeric part only - N816QS -> 816QS, EJA816 -> 816
+  var m=resolveMarker(identToMarkerId[key]);
+  // Try variant: without leading N
+  if(!m){
+    var noN=key.replace(/^N/,'');
+    if(noN)m=resolveMarker(identToMarkerId[noN]);
+  }
+  // Numeric-part match
+  if(!m){
     var nums=key.replace(/^[A-Z]+/,'');
     if(nums.length>=3){
       for(var k in identToMarkerId){
+        if(!identToMarkerId.hasOwnProperty(k))continue;
         var kNums=k.replace(/^[A-Z]+/,'');
-        if(kNums===nums||k.indexOf(nums)>=0){mid=identToMarkerId[k];break;}
+        if(kNums===nums){
+          m=resolveMarker(identToMarkerId[k]);
+          if(m)break;
+        }
       }
     }
   }
-  if(!mid){
-    // Brute force - check all markers for matching callsign in popup
-    for(var k in identToMarkerId){if(k.indexOf(key)>=0||key.indexOf(k)>=0){mid=identToMarkerId[k];break;}}
+  // Last-resort substring match, but with strict marker validation
+  if(!m){
+    for(var k in identToMarkerId){
+      if(!identToMarkerId.hasOwnProperty(k))continue;
+      if(k.length<3||key.length<3)continue; // avoid nonsense short matches
+      if(k===key||k.indexOf(key)>=0||key.indexOf(k)>=0){
+        m=resolveMarker(identToMarkerId[k]);
+        if(m)break;
+      }
+    }
   }
-  if(mid&&markers[mid]){
-    var ll=markers[mid].getLatLng();
-    var ksfo=L.latLng(37.6213,-122.3790);
-    // Calculate bounds that include both the plane and KSFO
+  if(m){
+    var ll=m.getLatLng();
+    var ksfo=L.latLng(37.62818383496824,-122.38486782258192);
+    var dKm=ll.distanceTo(ksfo)/1000;
     var bounds=L.latLngBounds([ll,ksfo]);
-    leafMap.fitBounds(bounds.pad(0.15),{animate:true,maxZoom:13});
-    markers[mid].openPopup();
-    // Flash effect
-    var el=markers[mid].getElement();
-    if(el){el.style.filter='brightness(2) drop-shadow(0 0 8px #fff)';setTimeout(function(){el.style.filter='';},2000);}
+    var padFactor=dKm<50?0.4:dKm<200?0.25:0.15;
+    var maxZ=dKm<20?12:dKm<100?10:dKm<400?8:6;
+    leafMap.fitBounds(bounds.pad(padFactor),{animate:true,duration:0.6,maxZoom:maxZ});
+    try{m.openPopup();}catch(e){}
+    // Flash effect on the plane marker
+    var el=m.getElement&&m.getElement();
+    if(el){
+      el.style.filter='brightness(2) drop-shadow(0 0 8px #fff)';
+      setTimeout(function(){if(el)el.style.filter='';},2000);
+    }
   } else {
-    // Plane not on map - don't scroll, just log
-    console.log('Plane not found on map:',ident);
+    console.log('[zoom] plane not on map:',ident,'key:',key,'known keys:',Object.keys(identToMarkerId).length);
   }
 }
 // Reset map on mouse leave
@@ -1083,23 +2442,46 @@ function drawHUD(){
 }
 
 function mkRow(f,cls,done){
-  var id=f.ident||'';
+  var id=safeStr(f.ident);
   var col=getIdentColor(id);
   if(id)faIdents[id.toUpperCase().replace(/ /g,'')]=col;
-  if(f.callsign)faIdents[f.callsign.toUpperCase().replace(/ /g,'')]=col;
-  
+  if(f.callsign)faIdents[safeStr(f.callsign).toUpperCase().replace(/ /g,'')]=col;
+  // XSS hardening: escape all FA-sourced string fields before interpolating into HTML
+  // Note: id is also used as the visible text, so we escape id itself too
+  var idSafe=htmlEsc(id);
+  var callsignSafe=htmlEsc(f.callsign);
   var heliTag=HELI[f.type]?'🚁 ':'';
-  var csSub=f.callsign?'<span class="sub">'+f.callsign+'</span>':'';
-  var loc=cls==='ar'?(f.from||''):(f.to||'');
-  var flag=getFlag(loc);
+  // Operator brand pill — small color-coded badge for fractional/charter operators (NetJets, Flexjet,
+  // VistaJet, Wheels Up, etc.). Visible identifier without using trademarked logos.
+  // Computed once here so all row return paths (done, dep-simple, arr-done, en-route) can use it.
+  var opBadge=opBrandPill(f.operator);
+  // Medical transport badge — red cross for air ambulance / medevac flights (Angel Flight, AirMed,
+  // REACH, Mercy Flight, etc.). Hoisted here so it shows on departures and landed planes too,
+  // not just en-route arrivals. The medical detection runs against both the FA ident and callsign.
+  var medBadge='';
+  var medOp=isMedical(f.ident,f.callsign);
+  if(medOp){
+    medBadge='<span title="Medical transport — '+htmlEsc(medOp)+'" style="display:inline-block;background:#dc2626;color:#fff;font-size:9px;font-weight:800;padding:1px 4px;border-radius:3px;margin-left:4px;letter-spacing:.3px;line-height:1">✚</span>';
+  }
+  // csSub: the callsign sub-line. Originally just "EJA751" below the tail. We wrap in a span with
+  // class "sub" which has flex-basis:100% so it gets its own line. Per-path return sites build a
+  // combined subRow that puts callsign + all badges (op, vip, med, qt) into this same line so
+  // badges have a deterministic position instead of wrapping unpredictably at narrow widths.
+  var csSub=f.callsign?'<span class="sub">'+callsignSafe+'</span>':'';
+  var loc=cls==='ar'?safeStr(f.from):safeStr(f.to);
+  var locSafe=htmlEsc(loc);
+  var flag=getFlag(loc,HELI[f.type]?true:false);
   var locSub='';
-  if(f.intl&&f.country)locSub='<span class="sub">'+f.country+'</span>';
-  else if(f.city)locSub='<span class="sub">'+f.city+'</span>';
+  if(f.intl&&f.country)locSub='<span class="sub">'+htmlEsc(f.country)+'</span>';
+  else if(f.city)locSub='<span class="sub">'+htmlEsc(f.city)+'</span>';
   var ffcls=f.intl?'ff intl':'ff';
   // Type with model name sub
-  var typeCode=f.type||'';
+  var typeCode=safeStr(f.type);
+  var typeCodeSafe=htmlEsc(typeCode);
   var modelName=MODEL[typeCode]||'';
-  var typeSub=modelName?'<span class="sub">'+modelName+'</span>':'';
+  var typeSub=modelName?'<span class="sub">'+htmlEsc(modelName)+'</span>':'';
+  var departSafe=htmlEsc(f.depart);
+  var arriveSafe=htmlEsc(f.arrive);
   var rawEta=cls==='ar'?calcMins(f.arriveISO):calcMins(f.departISO);
   var eta=rawEta<0?0:rawEta;
   var fecls='fe '+(eta<=15?'soon':eta<=60?'mid':'far');
@@ -1112,9 +2494,9 @@ function mkRow(f,cls,done){
     var ago2=Math.round((Date.now()-new Date(f.departISO||0).getTime())/60000);
     etaStr=ago2>=0?'<span style="color:var(--red)">'+fmtHM(ago2)+'</span>':'—';
   }
-  else if(cls==='ar'&&!done&&f._landed)etaStr='<span style="color:var(--green);font-weight:700">LANDED</span>';
-  else if(cls==='ar'&&!done&&rawEta<=5&&rawEta>0)etaStr='<span style="color:var(--amber);font-weight:700">FINAL</span>';
-  else if(cls==='ar'&&!done&&rawEta<=0)etaStr='<span style="color:var(--green);font-weight:700">LANDED</span>';
+  else if(cls==='ar'&&!done&&f._landed)etaStr='<span class="arr-eta" data-tail="'+htmlEsc((f.ident||'').toUpperCase())+'" data-callsign="'+htmlEsc((f.callsign||'').toUpperCase())+'" style="color:var(--green);font-weight:700">LANDED</span>';
+  else if(cls==='ar'&&!done&&rawEta<=5&&rawEta>0)etaStr='<span class="arr-eta" data-tail="'+htmlEsc((f.ident||'').toUpperCase())+'" data-callsign="'+htmlEsc((f.callsign||'').toUpperCase())+'" style="color:var(--amber);font-weight:700">FINAL</span>';
+  else if(cls==='ar'&&!done&&rawEta<=0)etaStr='<span class="arr-eta" data-tail="'+htmlEsc((f.ident||'').toUpperCase())+'" data-callsign="'+htmlEsc((f.callsign||'').toUpperCase())+'" style="color:var(--green);font-weight:700">LANDED</span>';
   else if(rawEta>0)etaStr=fmtHM(rawEta);
   var rowCls='';
   if(cls==='ar'&&!done)rowCls=' arr-active';
@@ -1128,16 +2510,20 @@ function mkRow(f,cls,done){
       var cidDone=cid;
       var manSpotD2=window._parkingAssignments&&window._parkingAssignments[cidDone]?window._parkingAssignments[cidDone]:'';
       var depDoneSpot=manSpotD2||sugD2.spot;
-      var depDoneCell='<span class="fm spot-click" data-plane="'+cidDone+'" style="font-size:9px;font-weight:700;color:var(--cyan);line-height:1.2;cursor:pointer">'+depDoneSpot+'</span>';
-      return '<div class="fr dep-simple"><span class="fi">'+id+csSub+'</span><span class="ft" style="line-height:1.1">'+(typeCode||'—')+typeSub+'</span><span class="'+ffcls+'">'+flag+(flag?' ':'')+(loc||'—')+locSub+'</span><span class="fm">'+(f.depart||'—')+'</span><span class="fm">'+etaStr+'</span>'+depDoneCell+'</div>';
+      var depDoneCell='<span class="fm spot-click" data-plane="'+cidDone+'" style="font-size:9px;font-weight:700;color:var(--cyan);line-height:1.2;cursor:pointer">'+htmlEsc(depDoneSpot)+'</span>';
+      var subRowDS=f.callsign?'<span class="sub" style="display:flex;flex-wrap:wrap;align-items:center;gap:3px;flex-basis:100%;width:100%">'+
+        callsignSafe+'</span>':'';
+      return '<div class="fr dep-simple"><span class="fi zp" data-zp="'+cidDone+'">'+idSafe+subRowDS+'</span><span class="fop">'+opBadge+'</span><span class="fst">'+medBadge+'</span><span class="ft" style="line-height:1.1">'+(typeCodeSafe||'—')+typeSub+'</span><span class="'+ffcls+'">'+flag+(flag?' ':'')+(locSafe||'—')+locSub+'</span><span class="fm">'+(departSafe||'—')+'</span><span class="fm">'+etaStr+'</span>'+depDoneCell+'</div>';
     }
     // Spot for departure
     var isHD=HELI[f.type]?true:false;
     var sugD=suggestSpot(f.type,2,isHD,f.ident);
     var manSpotD=window._parkingAssignments&&window._parkingAssignments[cid]?window._parkingAssignments[cid]:'';
     var depSpotText=manSpotD||sugD.spot;
-    var depSpotCell='<span class="fm spot-click" data-plane="'+cid+'" style="font-size:9px;font-weight:700;color:var(--cyan);line-height:1.2;cursor:pointer">'+depSpotText+'</span>';
-    return '<div class="fr dep'+rowCls+'"><span class="fi">'+id+csSub+'</span><span class="ft" style="line-height:1.1">'+(typeCode||'—')+typeSub+'</span><span class="'+ffcls+'">'+flag+(flag?' ':'')+(loc||'—')+locSub+'</span><span class="fm">'+(f.depart||'—')+'</span><span class="'+fecls+'">'+etaStr+'</span>'+depSpotCell+'<input class="chk" type="checkbox" id="cat_'+cid+'" onclick="event.stopPropagation()" /><input class="chk" type="checkbox" id="cip_'+cid+'" onclick="event.stopPropagation()" /><input class="chk" type="checkbox" id="fuel_'+cid+'" onclick="event.stopPropagation()" /><input class="chk" type="checkbox" id="lav_'+cid+'" onclick="event.stopPropagation()" /><input class="chk" type="checkbox" id="h2o_'+cid+'" onclick="event.stopPropagation()" /></div>';
+    var depSpotCell='<span class="fm spot-click" data-plane="'+cid+'" style="font-size:9px;font-weight:700;color:var(--cyan);line-height:1.2;cursor:pointer">'+htmlEsc(depSpotText)+'</span>';
+    var subRowD=f.callsign?'<span class="sub" style="display:flex;flex-wrap:wrap;align-items:center;gap:3px;flex-basis:100%;width:100%">'+
+      callsignSafe+'</span>':'';
+    return '<div class="fr dep'+rowCls+'"><span class="fi zp" data-zp="'+cid+'">'+idSafe+subRowD+'</span><span class="fop">'+opBadge+'</span><span class="fst">'+medBadge+'</span><span class="ft" style="line-height:1.1">'+(typeCodeSafe||'—')+typeSub+'</span><span class="'+ffcls+'">'+flag+(flag?' ':'')+(locSafe||'—')+locSub+'</span><span class="fm">'+(departSafe||'—')+'</span><span class="'+fecls+'">'+etaStr+'</span>'+depSpotCell+'</div>';
   }
   var paxId='ar_'+(id).replace(/[^a-zA-Z0-9]/g,'');
   // PROGRESS BAR - simple logic:
@@ -1157,6 +2543,31 @@ function mkRow(f,cls,done){
   if(pPct<0)pPct=0;if(pPct>100)pPct=100;
   if(f._landed)pPct=100;
 
+  // TAKEOFF DETECTION: track ground->airborne transitions for 60s flash
+  if(!window._lastGroundState)window._lastGroundState={};
+  if(!window._takeoffFlash)window._takeoffFlash={};
+  var idKey=(f.ident||'').toUpperCase();
+  if(idKey&&cls==='ar'&&!done&&!f._landed){
+    var wasOnGround=window._lastGroundState[idKey];
+    var isOnGroundNow=!hasDep;
+    // First time we see them: just record state, don't flash
+    if(wasOnGround===true&&isOnGroundNow===false){
+      // TRANSITION: ground -> airborne. Flag for 60s flash
+      window._takeoffFlash[idKey]=Date.now();
+    }
+    window._lastGroundState[idKey]=isOnGroundNow;
+  }
+  // Check if this row is in flash window
+  var flashClass='';
+  if(idKey&&window._takeoffFlash[idKey]){
+    var flashAge=Date.now()-window._takeoffFlash[idKey];
+    if(flashAge<60000){
+      flashClass=' takeoff-flash';
+    } else {
+      delete window._takeoffFlash[idKey];
+    }
+  }
+
   // Add "on ground" for arrivals not yet airborne
   if(cls==='ar'&&!done&&!f._landed&&!hasDep){
     etaStr+='<br><span style="font-size:7px;color:var(--t3);font-weight:600;letter-spacing:.3px">on ground</span>';
@@ -1169,44 +2580,94 @@ function mkRow(f,cls,done){
     var safeId3=id.replace(/[^a-zA-Z0-9]/g,'');
     var manSpot2=window._parkingAssignments&&window._parkingAssignments[safeId3]?window._parkingAssignments[safeId3]:'';
     var arrSpotText=manSpot2||sug2.spot;
-    var arrSpotCell='<span class="fm spot-click" data-plane="'+safeId3+'" style="font-size:9px;font-weight:700;color:var(--cyan);line-height:1.2;cursor:pointer">'+arrSpotText+'</span>';
-    return '<div class="fr arr-done"><span class="fi">'+id+csSub+'</span><span class="ft" style="line-height:1.1">'+(typeCode||'—')+typeSub+'</span><span class="'+ffcls+'">'+flag+(flag?' ':'')+(loc||'—')+locSub+'</span><span class="fm">'+(f.depart||'—')+'</span><span class="fm">'+(f.arrive||'—')+'</span><span class="'+fecls+'">'+etaStr+'</span>'+arrSpotCell+'</div>';
+    var arrSpotCell='<span class="fm spot-click" data-plane="'+safeId3+'" style="font-size:9px;font-weight:700;color:var(--cyan);line-height:1.2;cursor:pointer">'+htmlEsc(arrSpotText)+'</span>';
+    // VIP badge (applies to arrivals, including already-landed)
+    var vipBadgeDone=cls==='ar'&&isVip(f.ident,f.callsign)?'<span title="VIP" style="display:inline-block;background:linear-gradient(135deg,#a855f7,#7c3aed);color:#fff;font-size:8px;font-weight:900;padding:1px 5px;border-radius:3px;margin-left:4px;letter-spacing:.6px;line-height:1;box-shadow:0 0 6px rgba(168,85,247,.5)">VIP</span>':'';
+    // GPU badge on arrived rows too — ramp crew references this list to confirm services given.
+    var gpuBadgeDone='';
+    if(cls==='ar'&&needsGPU(f.ident,f.callsign)){
+      var _gpuOpD=getCorporateOperator(f.ident,f.callsign);
+      var _gpuTitleD=(_gpuOpD&&_gpuOpD.title)?_gpuOpD.title:'GPU requested on arrival';
+      gpuBadgeDone='<span title="'+htmlEsc(_gpuTitleD)+'" style="display:inline-block;background:#f59e0b;color:#111827;font-size:8px;font-weight:900;padding:1px 5px;border-radius:3px;margin-left:4px;letter-spacing:.5px;line-height:1">GPU</span>';
+    }
+    var subRowAD=f.callsign?'<span class="sub" style="display:flex;flex-wrap:wrap;align-items:center;gap:3px;flex-basis:100%;width:100%">'+
+      callsignSafe+'</span>':'';
+    return '<div class="fr arr-done"><span class="fi zp" data-zp="'+safeId3+'">'+idSafe+subRowAD+'</span><span class="fop">'+opBadge+'</span><span class="fst">'+vipBadgeDone+gpuBadgeDone+medBadge+'</span><span class="ft" style="line-height:1.1">'+(typeCodeSafe||'—')+typeSub+'</span><span class="'+ffcls+'">'+flag+(flag?' ':'')+(locSafe||'—')+locSub+'</span><span class="fm">'+(departSafe||'—')+'</span><span class="fm">'+(arriveSafe||'—')+'</span><span class="'+fecls+'">'+etaStr+'</span>'+arrSpotCell+'</div>';
   }
   var enRoute=hasDep&&!done&&!f._landed;
   var gd=enRoute?'<span style="position:absolute;left:4px;top:8px;width:7px;height:7px;border-radius:50%;background:#22c55e;box-shadow:0 0 5px rgba(34,197,94,.5)"></span>':'';
   var safeId=id.replace(/[^a-zA-Z0-9]/g,'');
-  // Calculate suggested parking spot (avoiding already-assigned spots)
+  // (medBadge already computed at top of mkRow alongside opBadge)
+  // QT detection: check if this aircraft has a departure within 2hr of arrival
+  var qtBadge='';
+  if(cls==='ar'&&!done&&f.ident&&window._depByTail){
+    var tk=(f.ident||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+    var nextDep=window._depByTail[tk];
+    if(nextDep&&f.arriveISO){
+      var arrT=new Date(f.arriveISO).getTime();
+      var depT=new Date(nextDep).getTime();
+      var diffH=(depT-arrT)/3600000;
+      if(diffH>0&&diffH<=2){
+        qtBadge='<span style="display:inline-block;background:#fbbf24;color:#000;font-size:8px;font-weight:800;padding:1px 4px;border-radius:3px;margin-left:4px;letter-spacing:.5px">QT</span>';
+      }
+    }
+  }
+  // Calculate parking spot. Per ramp workflow: only show a real spot if we have HIGH CONFIDENCE
+  // about it — either a manual assignment OR an ADS-B-confirmed shutdown spot. Algorithmic
+  // suggestions are NOT used here anymore — they were guessing and the user couldn't tell which
+  // rows were guesses vs facts. An unassigned row shows "—" and is clickable for manual assignment.
   var isH=HELI[f.type]?true:false;
-  var stayHrs=24;
+  var stayHrs=qtBadge?2:24;
   var safeId2=id.replace(/[^a-zA-Z0-9]/g,'');
-  // Check if manually assigned
   var manualSpot=window._parkingAssignments&&window._parkingAssignments[safeId2]?window._parkingAssignments[safeId2]:'';
   var finalSpot='';
   var towNote='';
   if(manualSpot){
     finalSpot=manualSpot;
-  } else {
-    var sug=suggestSpot(f.type,stayHrs,isH,f.ident);
-    finalSpot=sug.spot;towNote=sug.tow||'';
-    // If spot already taken, find next available of same type
-    if(window._spotOccupied&&window._spotOccupied[finalSpot]){
-      var cat2=getWsCat(f.type);
-      var alternatives=[];
-      for(var si=0;si<SPOT_DEFS.length;si++){
-        var sd=SPOT_DEFS[si];
-        if(sd.cats.indexOf(cat2)>=0&&!window._spotOccupied[sd.name]&&sd.name!==finalSpot){
-          alternatives.push(sd.name);
-        }
-      }
-      if(alternatives.length>0)finalSpot=alternatives[0];
-    }
   }
-  // Mark spot as occupied
-  if(window._spotOccupied)window._spotOccupied[finalSpot]=safeId2;
-  var spotText=finalSpot;
-  if(towNote)spotText+='<br><span style="font-size:7px;color:var(--t3)">'+towNote+'</span>';
-  var spotCell='<span class="fm spot-click" data-plane="'+safeId2+'" style="font-size:9px;font-weight:700;color:var(--cyan);line-height:1.2;cursor:pointer">'+spotText+'</span>';
-  return '<div class="fr'+rowCls+'"><span class="fi zp" data-zp="'+safeId+'">'+gd+id+csSub+'</span><span class="ft" style="line-height:1.1">'+(typeCode||'—')+typeSub+'</span><span class="'+ffcls+'">'+flag+(flag?' ':'')+(loc||'—')+locSub+'</span><span class="fm">'+(f.depart||'—')+'</span><span class="fm">'+(f.arrive||'—')+'</span><span class="'+fecls+'">'+etaStr+'</span>'+spotCell+'<input class="pax" type="number" min="0" max="99" placeholder="—" id="pax_'+paxId+'" onclick="event.stopPropagation()" /></div>';
+  // Mark spot as occupied if we have a real assignment (skip the unassigned default)
+  if(finalSpot&&window._spotOccupied)window._spotOccupied[finalSpot]=safeId2;
+  // Display: real spot name when assigned, otherwise an em-dash placeholder.
+  var spotText=finalSpot||'—';
+  if(towNote)spotText+='<br><span style="font-size:7px;color:var(--t3)">'+htmlEsc(towNote)+'</span>';
+  // spotText may contain HTML (towNote subspan), so we escape the leading text part only
+  var spotTextEsc=spotText.indexOf('<')>=0?(htmlEsc(spotText.substring(0,spotText.indexOf('<')))+spotText.substring(spotText.indexOf('<'))):htmlEsc(spotText);
+  // Unassigned cells are dimmer to make assigned vs unassigned distinguishable at a glance.
+  var spotColor=finalSpot?'var(--cyan)':'var(--t3)';
+  var spotCell='<span class="fm spot-click" data-plane="'+safeId2+'" style="font-size:9px;font-weight:700;color:'+spotColor+';line-height:1.2;cursor:pointer" title="'+(finalSpot?'Click to change spot':'Click to assign spot')+'">'+spotTextEsc+'</span>';
+  // DEPARTED indicator: instead of a separate badge that grows the row vertically, override the
+  // ETA cell content with a "DEPARTED" label + altitude readout for the 60-second flash window.
+  // The row's existing pulsing background animation already draws attention; an extra block-level
+  // badge was redundant and made the row 2-3x taller.
+  // We stash BOTH tail (FA ident) and callsign on the cell so the 2-second updater can match
+  // against either — fractionals like N815QS broadcast their ICAO callsign (EJA815) on ADS-B,
+  // not the tail number, so a tail-only match always misses them.
+  var depBadgeHtml='';
+  if(flashClass){
+    etaStr='<span class="dep-eta" data-tail="'+htmlEsc(idKey)+'" data-callsign="'+htmlEsc((f.callsign||'').toUpperCase())+'" style="color:#16a34a;font-weight:800;font-size:9px;letter-spacing:.4px">✈ DEPARTED<br><span class="alt" style="font-size:8px;font-weight:700;color:#16a34a">--ft</span></span>';
+  }
+  // VIP badge — shown for arrivals whose tail matches VIP_TAILS
+  var vipBadge='';
+  if(cls==='ar'&&isVip(f.ident,f.callsign)){
+    vipBadge='<span title="VIP" style="display:inline-block;background:linear-gradient(135deg,#a855f7,#7c3aed);color:#fff;font-size:8px;font-weight:900;padding:1px 5px;border-radius:3px;margin-left:4px;letter-spacing:.6px;line-height:1;box-shadow:0 0 6px rgba(168,85,247,.5)">VIP</span>';
+  }
+  // GPU badge — shown for arriving corporate aircraft whose operators routinely request a
+  // ground power unit. Detected via CORPORATE_OPERATORS table (matches ICAO callsign, tail
+  // suffix, or explicit tail list). Amber pill matches the "needs attention before arrival"
+  // visual language — the ramp crew sees it and pre-stages a GPU cart.
+  var gpuBadge='';
+  if(cls==='ar'&&needsGPU(f.ident,f.callsign)){
+    var _gpuOp=getCorporateOperator(f.ident,f.callsign);
+    var _gpuTitle=(_gpuOp&&_gpuOp.title)?_gpuOp.title:'GPU requested on arrival';
+    gpuBadge='<span title="'+htmlEsc(_gpuTitle)+'" style="display:inline-block;background:#f59e0b;color:#111827;font-size:8px;font-weight:900;padding:1px 5px;border-radius:3px;margin-left:4px;letter-spacing:.5px;line-height:1">GPU</span>';
+  }
+  // (opBadge already computed at top of mkRow)
+  // subRow: combined callsign + badges line, sits below the tail. All badges live here on a
+  // single flex line that takes full width (flex-basis:100%) inside the .fi flex container.
+  // Order: callsign first, then operator/VIP/medical/QT badges.
+  var subRow=f.callsign?'<span class="sub" style="display:flex;flex-wrap:wrap;align-items:center;gap:3px;flex-basis:100%;width:100%">'+
+    callsignSafe+'</span>':'';
+  return '<div class="fr'+rowCls+flashClass+'"><span class="fi zp" data-zp="'+safeId+'">'+gd+idSafe+subRow+depBadgeHtml+'</span><span class="fop">'+opBadge+'</span><span class="fst">'+qtBadge+vipBadge+gpuBadge+medBadge+'</span><span class="ft" style="line-height:1.1">'+(typeCodeSafe||'—')+typeSub+'</span><span class="'+ffcls+'">'+flag+(flag?' ':'')+(locSafe||'—')+locSub+'</span><span class="fm">'+(departSafe||'—')+'</span><span class="fm">'+(arriveSafe||'—')+'</span><span class="'+fecls+'">'+etaStr+'</span>'+spotCell+'<input class="pax" type="number" min="0" max="99" placeholder="—" id="pax_'+paxId+'" onclick="event.stopPropagation()" /></div>';
 }
 
 function calcMins(isoTime){
@@ -1303,6 +2764,15 @@ function fetchBoards(){
       var h='';
       for(var i=0;i<Math.min(completed.length,20);i++){h+=mkRow(completed[i],'de',true);}
       ddb.innerHTML=h;document.getElementById('ddc').textContent=completed.length;if(window.twemoji)twemoji.parse(ddb);
+    // Build tail -> next departure ISO map for QT detection
+    window._depByTail={};
+    if(dep)for(var di=0;di<dep.length;di++){
+      var df=dep[di];
+      var tk=safeStr(df.ident).toUpperCase().replace(/[^A-Z0-9]/g,'');
+      if(tk&&df.departISO){
+        if(!window._depByTail[tk]||df.departISO<window._depByTail[tk])window._depByTail[tk]=df.departISO;
+      }
+    }
     }else{dh.style.display='none';ddb.style.display='none';var dhc=document.getElementById('dhcols');if(dhc)dhc.style.display='none';}
   }).catch(function(e){console.warn('FA dep:',e);});
   setTimeout(drawHUD,500);
@@ -1313,23 +2783,10 @@ function now(){return new Date().toLocaleTimeString('en-US',{hour:'2-digit',minu
 function setPill(c,t){document.getElementById('pill').className='pill '+c;document.getElementById('pt').textContent=t;}
 
 // WebSocket for SWIM status
-function connectWS(){
-  try{
-    var ws=new WebSocket('ws://'+location.hostname+':8765');
-    ws.onopen=function(){document.getElementById('fs').className='fd on';};
-    ws.onmessage=function(e){
-      try{
-        var m=JSON.parse(e.data);
-        if(m.type==='swimStatus'){
-          document.getElementById('fs').className=m.status==='connected'?'fd on':'fd off';
-        }
-      }catch(x){}
-    };
-    ws.onerror=function(){document.getElementById('fs').className='fd off';};
-    ws.onclose=function(){document.getElementById('fs').className='fd off';setTimeout(connectWS,10000);};
-  }catch(e){}
-}
-connectWS();
+// WebSocket connection removed in v220 — was only used to update the SWIM status pill,
+// and SWIM data wasn't consumed anywhere in the UI. Server-side SWIM code is still present
+// (see connectSWIM in server.js) but disabled at startup. If you want to re-enable real-time
+// SWIM feeds later, restart server-side SWIM and re-add a WS client here.
 
 function fmtHM(totalMins){
   var h=Math.floor(totalMins/60);
@@ -1360,17 +2817,26 @@ function drawChart(){
   if(!el)return;
   Promise.all([
     fetch('/fa/arrivals').then(function(r){return r.json();}),
-    fetch('/fa/departures').then(function(r){return r.json();})
+    fetch('/fa/departures').then(function(r){return r.json();}),
+    fetch('/fa/ground').then(function(r){return r.json();}).catch(function(){return[];})
   ]).then(function(res){
-    var arr=res[0]||[],dep=res[1]||[];
+    var arr=res[0]||[],dep=res[1]||[],gnd=res[2]||[];
     var now=new Date();var curH=now.getHours();var nowMs=Date.now();
     var hours=[];for(var i=0;i<5;i++)hours.push((curH+i+1)%24);
-    var ac=[],dc=[],mx=1;
+    var ac=[],dc=[],gc=[],mx=1;
+    var baseGround=gnd.length;
     for(var i=0;i<5;i++){
       var hr=hours[i];var a=0,d=0;
       for(var j=0;j<arr.length;j++){if(!arr[j].arriveISO||arr[j].arrived)continue;if(new Date(arr[j].arriveISO).getHours()===hr)a++;}
       for(var j=0;j<dep.length;j++){if(!dep[j].departISO||dep[j].departed)continue;if(new Date(dep[j].departISO).getHours()===hr)d++;}
       ac.push(a);dc.push(d);if(a>mx)mx=a;if(d>mx)mx=d;
+    }
+    // Cumulative ground count: start from current live ground count, net change per hour = arrivals - departures
+    var running=baseGround;
+    for(var i=0;i<5;i++){
+      running=running+ac[i]-dc[i];
+      if(running<0)running=0;
+      gc.push(running);
     }
     // Calculate deltas
     var aDelta=[],dDelta=[];
@@ -1396,11 +2862,42 @@ function drawChart(){
       h+='<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:0">';
       h+='<div style="flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;width:100%">';
       if(ac[i]>0)h+='<span style="font-family:var(--mono);font-size:10px;font-weight:800;color:#3b82f6;margin-bottom:2px">'+ac[i]+aDeltaStr+'</span>';
-      h+='<div style="width:60%;min-height:2px;height:'+aPct+'%;background:linear-gradient(180deg,#3b82f6,#60a5fa);border-radius:3px 3px 0 0;transition:height .4s"></div>';
+      // Segmented arrivals bar - one segment per plane, darker as count increases
+      h+='<div style="width:60%;display:flex;flex-direction:column-reverse;height:'+aPct+'%;min-height:'+(ac[i]>0?(ac[i]*3):2)+'px;border-radius:3px 3px 0 0;overflow:hidden;box-shadow:0 1px 2px rgba(59,130,246,.2)">';
+      if(ac[i]===0){
+        h+='<div style="height:2px;background:#dbeafe"></div>';
+      } else {
+        for(var sg=0;sg<ac[i];sg++){
+          // Lighter at bottom (first plane = light blue), darker at top (heavier traffic = darker blue)
+          // Lightness goes from 78% (bottom) to 42% (top)
+          var t=ac[i]>1?(sg/(ac[i]-1)):0; // 0 at bottom, 1 at top
+          var light=Math.round(78-t*36); // 78 -> 42
+          var sat=Math.round(72+t*18); // 72 -> 90
+          var segColor='hsl(217,'+sat+'%,'+light+'%)';
+          h+='<div style="flex:1;background:'+segColor+';border-bottom:1px solid rgba(255,255,255,.5);min-height:2px"></div>';
+        }
+      }
       h+='</div>';
-      h+='<div style="width:100%;height:1px;background:#e2e4e9;flex-shrink:0"></div>';
+      h+='</div>';
+      // === GOLD BAND: aircraft on ground at this hour ===
+      h+='<div style="width:60%;display:flex;align-items:center;justify-content:center;background:linear-gradient(180deg,#fbbf24,#d97706);color:#fff;font-family:var(--mono);font-size:10px;font-weight:800;padding:2px 0;border-top:1px solid rgba(0,0,0,.08);border-bottom:1px solid rgba(0,0,0,.08);box-shadow:inset 0 1px 0 rgba(255,255,255,.35),0 1px 2px rgba(217,119,6,.25);text-shadow:0 1px 1px rgba(0,0,0,.3);flex-shrink:0;min-height:16px" title="~'+gc[i]+' aircraft on ground at '+lbl+'">'+gc[i]+'</div>';
       h+='<div style="flex:1;display:flex;flex-direction:column;justify-content:flex-start;align-items:center;width:100%">';
-      h+='<div style="width:60%;min-height:2px;height:'+dPct+'%;background:linear-gradient(180deg,#f87171,#dc2626);border-radius:0 0 3px 3px;transition:height .4s"></div>';
+      // Segmented departures bar - mirror style, darker at top
+      h+='<div style="width:60%;display:flex;flex-direction:column;height:'+dPct+'%;min-height:'+(dc[i]>0?(dc[i]*3):2)+'px;border-radius:0 0 3px 3px;overflow:hidden;box-shadow:0 -1px 2px rgba(220,38,38,.2)">';
+      if(dc[i]===0){
+        h+='<div style="height:2px;background:#fee2e2"></div>';
+      } else {
+        for(var sg=0;sg<dc[i];sg++){
+          // For departures: top segment (sg=0) is lightest, bottom segment is darkest
+          // Since column-direction not reversed, sg=0 is at top
+          var t=dc[i]>1?(sg/(dc[i]-1)):0;
+          var light=Math.round(78-t*36);
+          var sat=Math.round(72+t*18);
+          var segColor='hsl(0,'+sat+'%,'+light+'%)';
+          h+='<div style="flex:1;background:'+segColor+';border-top:1px solid rgba(255,255,255,.5);min-height:2px"></div>';
+        }
+      }
+      h+='</div>';
       if(dc[i]>0)h+='<span style="font-family:var(--mono);font-size:10px;font-weight:800;color:#dc2626;margin-top:2px">'+dc[i]+dDeltaStr+'</span>';
       h+='</div>';
       h+='<span style="font-family:var(--mono);font-size:8px;font-weight:700;color:#9ca3af;padding-top:4px;flex-shrink:0">'+lbl+'</span>';
@@ -1410,6 +2907,257 @@ function drawChart(){
   }).catch(function(){});
 }
 
+// === HELICOPTER PROXIMITY SCANNER ===
+// Helicopters rarely register in FlightAware and often appear suddenly on the ramp.
+// This scanner polls OpenSky directly for a tight bbox around KSFO, filters for
+// helicopter emitter categories + known heli ICAO types, and surfaces any heading
+// inbound within 15mi. Gives FBO staff a heads-up before the heli appears on ramp.
+var _inboundHelis={};
+function scanInboundHelis(){
+  var sfoLat=37.62818383496824,sfoLon=-122.38486782258192;
+  // Credit-saving optimization: reuse the main refresh()'s allAC data instead of making a
+  // separate OpenSky call. The main bbox (80nm) includes everything within the 15nm heli
+  // radius, so we can filter locally and save ~1000 credits/hour.
+  if(!window.allAC||!window.allAC.length){
+    // No shared data yet — skip this cycle rather than making a new API call
+    return;
+  }
+  var found={};
+  // Build a state array from allAC matching the OpenSky states[] shape
+  for(var i=0;i<window.allAC.length;i++){
+    var a=window.allAC[i];
+    var cs=safeStr(a.cs).trim();
+    var icao=a.id;
+    var lon=a.lon,lat=a.lat,alt=a.alt,gnd=a.gnd,spdKts=a.kts||0,trk=a.trk||0,cat=a.cat||0;
+      if(!lat||!lon)continue;
+      if(gnd)continue;
+      // Identify helicopters: emitter category 7 OR known heli type
+      // OpenSky category codes: 7 = rotorcraft
+      var isHeli=(cat===7);
+      // Fallback: check if callsign starts with known heli-operator prefix (CAL STAR, REACH, etc.)
+      if(!isHeli&&cs){
+        var csUp=cs.toUpperCase();
+        for(var pref in MEDICAL_OPS.callsigns){
+          if(csUp.indexOf(pref)===0){isHeli=true;break;}
+        }
+      }
+      // Also match common military/civilian heli callsigns
+      if(!isHeli&&cs){
+        var csUp2=cs.toUpperCase();
+        if(/^(LIFE|MED|AIR|RESC|SAR|COPTER|HELI|N[0-9]+H|PAPA|DUSTOFF|N[0-9]+HP)/.test(csUp2))isHeli=true;
+      }
+      if(!isHeli)continue;
+      // Distance check - must be within 15nm
+      var dLat=(lat-sfoLat)*60;
+      var dLon=(lon-sfoLon)*60*Math.cos(sfoLat*Math.PI/180);
+      var distNm=Math.sqrt(dLat*dLat+dLon*dLon);
+      if(distNm>15)continue;
+      // Bearing check - must be roughly heading toward SFO
+      var brg=Math.atan2(sfoLon-lon,sfoLat-lat)*180/Math.PI;
+      if(brg<0)brg+=360;
+      var diff=Math.abs(brg-trk);if(diff>180)diff=360-diff;
+      var inbound=diff<90; // roughly heading toward SFO
+      // Hovering (kts<20) within 5nm = treat as inbound (they may be holding for clearance)
+      if(!inbound&&distNm>5)continue;
+      // Rough ETA: distNm / groundspeed_nm/min * 60
+      var etaMin=spdKts>15?Math.round(distNm/(spdKts/60)):null;
+      var medOp=isMedical(cs,cs);
+      found[icao]={
+        icao:icao,
+        cs:cs||icao,
+        lat:lat,lon:lon,
+        alt:alt?Math.round(alt*3.28084):0,
+        kts:Math.round(spdKts),
+        trk:Math.round(trk),
+        distNm:distNm.toFixed(1),
+        etaMin:etaMin,
+        inbound:inbound,
+        medical:medOp,
+        cat:cat,
+        updated:Date.now()
+      };
+    }
+    _inboundHelis=found;
+    renderHeliPanel();
+    // Update HUD count
+    var n=Object.keys(found).length;
+    var cell=document.getElementById('heliHudCell');
+    var hh=document.getElementById('hh');
+    if(hh)hh.textContent=n;
+    // Visual alert: flash red background when a heli is detected
+    if(cell){
+      if(n>0){
+        cell.style.display='flex';
+        cell.style.background='rgba(220,38,38,.12)';
+        cell.style.borderColor='rgba(220,38,38,.4)';
+      } else {
+        cell.style.display='none';
+        cell.style.background='';
+        cell.style.borderColor='';
+      }
+    }
+}
+function renderHeliPanel(){
+  var panel=document.getElementById('heli-panel');
+  if(!panel)return;
+  var keys=Object.keys(_inboundHelis);
+  if(keys.length===0){
+    panel.innerHTML='<div style="padding:20px;text-align:center;color:var(--t3);font-size:11px;font-family:var(--mono)">No inbound helicopters detected within 15nm</div>';
+    return;
+  }
+  // Sort by distance
+  keys.sort(function(a,b){return parseFloat(_inboundHelis[a].distNm)-parseFloat(_inboundHelis[b].distNm);});
+  var h='<div style="padding:10px 16px 12px 16px">';
+  h+='<div style="font-family:var(--mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--t3);margin-bottom:8px">'+keys.length+' INBOUND HELI'+(keys.length>1?'S':'')+' — LIVE ADS-B</div>';
+  for(var i=0;i<keys.length;i++){
+    var hh=_inboundHelis[keys[i]];
+    var medBadge=hh.medical?'<span style="display:inline-block;background:#dc2626;color:#fff;font-size:9px;font-weight:800;padding:1px 4px;border-radius:3px;margin-left:5px;line-height:1" title="'+htmlEsc(hh.medical)+'">✚</span>':'';
+    var inboundBadge=hh.inbound?'<span style="display:inline-block;background:#16a34a;color:#fff;font-size:7px;font-weight:800;padding:1px 4px;border-radius:2px;margin-left:4px">INBOUND</span>':'<span style="display:inline-block;background:#64748b;color:#fff;font-size:7px;font-weight:800;padding:1px 4px;border-radius:2px;margin-left:4px">HOLDING</span>';
+    var etaStr=hh.etaMin!=null?hh.etaMin+' min':(hh.kts<15?'hovering':'—');
+    h+='<div style="display:grid;grid-template-columns:1.3fr .8fr .8fr .7fr .7fr;gap:8px;align-items:center;padding:8px 10px;background:var(--b1);border:1px solid var(--bd);border-left:3px solid '+(hh.medical?'#dc2626':(hh.inbound?'#16a34a':'#64748b'))+';border-radius:6px;margin-bottom:4px;font-family:var(--mono);font-size:11px">';
+    h+='<div style="font-weight:800;color:var(--cyan);font-size:13px">🚁 '+htmlEsc(hh.cs)+medBadge+inboundBadge;
+    if(hh.medical)h+='<div style="font-size:8px;color:#dc2626;font-weight:600;margin-top:2px">'+htmlEsc(hh.medical)+'</div>';
+    h+='</div>';
+    h+='<div style="color:var(--t1);text-align:center"><div style="font-weight:700">'+htmlEsc(hh.distNm)+'</div><div style="font-size:8px;color:var(--t3)">nm</div></div>';
+    h+='<div style="color:var(--t1);text-align:center"><div style="font-weight:700">'+(typeof hh.alt==="number"?hh.alt.toLocaleString():htmlEsc(hh.alt))+'</div><div style="font-size:8px;color:var(--t3)">ft MSL</div></div>';
+    h+='<div style="color:var(--t1);text-align:center"><div style="font-weight:700">'+htmlEsc(hh.kts)+'</div><div style="font-size:8px;color:var(--t3)">kts</div></div>';
+    h+='<div style="color:var(--t1);text-align:center;font-weight:700;'+(hh.etaMin!=null&&hh.etaMin<=5?'color:#dc2626':'')+'">'+htmlEsc(etaStr)+'</div>';
+    h+='</div>';
+  }
+  h+='</div>';
+  panel.innerHTML=h;
+}
+function showHeliPanel(){
+  document.getElementById('heli-overlay').style.display='block';
+  renderHeliPanel();
+}
+function closeHeliPanel(){
+  document.getElementById('heli-overlay').style.display='none';
+}
+
+// === OPENSKY CREDIT TRACKER ===
+// Polls /status on the server (which tracks every real OpenSky call) and updates the HUD.
+// The server computes cost per call using OpenSky's public pricing formula.
+window._creditStatus=null;
+// Format countdown seconds as H:MM:SS (or M:SS if under 1hr, or SS if under 1m)
+function fmtCountdown(totalSec){
+  if(totalSec<0)totalSec=0;
+  var h=Math.floor(totalSec/3600);
+  var m=Math.floor((totalSec%3600)/60);
+  var s=totalSec%60;
+  var pad=function(n){return n<10?'0'+n:String(n);};
+  if(h>0)return h+':'+pad(m)+':'+pad(s);
+  if(m>0)return m+':'+pad(s);
+  return s+'s';
+}
+// Credit HUD rendering — now a pill in the header bar alongside OPENSKY/ADSB/FLIGHTAWARE/SWIM.
+// The local 1-second ticker reuses this for live countdown without extra /status calls.
+function renderCreditHUD(){
+  var s=window._creditStatus;
+  if(!s)return;
+  var pillEl=document.getElementById('fcr');
+  var valEl=document.getElementById('fcrVal');
+  if(!pillEl||!valEl)return;
+  // Compute remaining backoff in real time from the anchored timestamp so the countdown
+  // ticks every second locally between server polls.
+  var liveSec=0;
+  if(window._backoffEndsAt){
+    liveSec=Math.max(0,Math.ceil((window._backoffEndsAt-Date.now())/1000));
+  }
+  var inBackoffNow=liveSec>0;
+  if(inBackoffNow){
+    // Rate-limited: show H:MM:SS countdown in red
+    valEl.textContent=fmtCountdown(liveSec);
+    pillEl.className='fd off';
+    pillEl.style.color='#ef4444';
+    pillEl.style.borderColor='rgba(239,68,68,.3)';
+    pillEl.style.background='rgba(239,68,68,.08)';
+    pillEl.title='Rate limited - retry in '+fmtCountdown(liveSec);
+  } else {
+    // Normal: show "3997/4000" with color based on usage level
+    var remaining=s.remaining;
+    var budget=s.budget;
+    var pct=budget>0?(1-(remaining/budget)):0;
+    valEl.textContent=remaining+'/'+budget;
+    // Clear inline styles, let CSS class handle it
+    pillEl.style.color='';
+    pillEl.style.borderColor='';
+    pillEl.style.background='';
+    // Pick class based on auth tier + usage
+    if(s.authMode==='anonymous'){
+      pillEl.className='fd off';
+      pillEl.style.color='#f59e0b';
+      pillEl.title='ANONYMOUS tier - only 400 credits/day. Check server logs.';
+    } else if(pct>=0.8){
+      pillEl.className='fd off';
+      pillEl.style.color='#ef4444';
+      pillEl.title='Low credits: '+remaining+'/'+budget+' remaining. Click for details.';
+    } else if(pct>=0.5){
+      pillEl.className='fd off';
+      pillEl.style.color='#f59e0b';
+      pillEl.title='Credits at '+remaining+'/'+budget+'. Click for details.';
+    } else {
+      pillEl.className='fd on';
+      pillEl.title=remaining+'/'+budget+' OpenSky credits remaining. Click for details.';
+    }
+  }
+}
+function updateCreditStatus(){
+  fetch('/status',{cache:'no-cache'}).then(function(r){return r.json();}).then(function(s){
+    window._creditStatus=s;
+    // Anchor the backoff end to a real timestamp so the local ticker can count down every second.
+    // When s.inBackoff flips false, clear the anchor so the HUD swaps back to remaining/budget display.
+    if(s.inBackoff){
+      window._backoffEndsAt=Date.now()+(s.backoffSecondsRemaining*1000);
+    } else {
+      window._backoffEndsAt=0;
+    }
+    renderCreditHUD();
+  }).catch(function(e){console.warn('[credit status]',e);});
+}
+function showCreditDetails(){
+  var s=window._creditStatus;
+  if(!s){alert('Status not loaded yet');return;}
+  var lines=[];
+  lines.push('=== OpenSky API Usage ===');
+  lines.push('');
+  lines.push('Auth mode: '+s.authMode.toUpperCase()+' ('+(s.authMode==='anonymous'?'400':'4000')+' credits/day tier)');
+  lines.push('');
+  lines.push('Credits remaining: '+s.remaining+' of '+s.budget);
+  lines.push('  (source: '+(s.remainingSource==='opensky-header'?'OpenSky authoritative header':'local estimate, no server response yet')+')');
+  lines.push('');
+  lines.push('Our tracking (last 24h rolling):');
+  lines.push('  Spent: '+s.spent24h+' credits in '+s.callCount24h+' calls');
+  lines.push('  Last hour: '+s.spentLastHour+' credits');
+  lines.push('');
+  if(s.inBackoff){
+    lines.push('⚠ RATE LIMITED');
+    lines.push('  Retry in '+s.backoffSecondsRemaining+'s');
+    lines.push('  (source: '+(s.backoffSource==='opensky-header'?'OpenSky Retry-After header':'local 60s fallback')+')');
+  } else {
+    lines.push('Status: OK (no backoff active)');
+  }
+  if(s.last429Ago!=null)lines.push('Last 429: '+s.last429Ago+'s ago');
+  if(s.lastSuccessAgo!=null)lines.push('Last success: '+s.lastSuccessAgo+'s ago');
+  lines.push('');
+  lines.push('Reset behavior:');
+  lines.push('  OpenSky uses a rolling 24-hour window per account,');
+  lines.push('  NOT a fixed UTC midnight reset. Credits become');
+  lines.push('  available again 24h after each one was spent.');
+  lines.push('  The countdown above reflects their actual timing.');
+  lines.push('');
+  lines.push('Cost per call depends on bbox size:');
+  lines.push('  • <=25 sq deg = 4 credits');
+  lines.push('  • 25-100 sq deg = 3 credits');
+  lines.push('  • 100-400 sq deg = 2 credits');
+  lines.push('  • >400 sq deg = 1 credit');
+  lines.push('');
+  if(s.authMode==='anonymous'){
+    lines.push('⚠ You are on ANONYMOUS tier. Check server logs for token errors.');
+  }
+  alert(lines.join(String.fromCharCode(10)));
+}
+
 function showGround(){
   document.getElementById('gnd-overlay').style.display='block';
   fetch('/fa/ground').then(function(r){return r.json();}).then(function(g){
@@ -1417,54 +3165,267 @@ function showGround(){
     window._globalSpotMap={};
     if(!g||!g.length){tb.innerHTML='<p style="text-align:center;color:var(--t3);padding:30px;font-family:var(--mono)">No aircraft on ground</p>';return;}
     var spotNames=['','Spot A','Spot 1','Spot 2','Spot 3','Spot 4','Spot 5','Ken Salvage','2nd Line 1','2nd Line 2','2nd Line 3','2nd Line 4','Overflow 1','Overflow 2','Btwn Hangars 1','Btwn Hangars 2','Btwn Hangars 3','Btwn Hangars 4','3rd Line 1','3rd Line 2','3rd Line 3','3rd Line 4','3rd Line 5','3rd Line 6','3rd Line 7','3rd Line 8','The Shop','Airfield Safety 1','Airfield Safety 2','4th Line 1','4th Line 2','4th Line 3','4th Line 4','41-7 A','41-7 B','41-11','42 West 1','42 West 2','42 West 3','42 West 4','The Island','The Fence','Hangar A','Hangar B','Hangar C'];
+    // Spot sort order: Spot A/1-5, Ken Salvage, 2nd Line, Overflow, Btwn Hangars, 3rd Line, Shop, AFS, 4th Line, 41-x, 42 West, Island, Fence, Hangars
+    var spotOrder={};
+    for(var oi=0;oi<spotNames.length;oi++)spotOrder[spotNames[oi]]=oi;
+    // Pre-compute each plane's assigned spot, then sort
+    var enriched=[];
+    for(var gi=0;gi<g.length;gi++){
+      var fg=g[gi];
+      var _dg=(fg.ident||'').replace(/[^a-zA-Z0-9]/g,'');
+      if(window._manuallyDeparted&&window._manuallyDeparted[_dg])continue;
+      var isHg=HELI[fg.type]?true:false;
+      var shrs=24;
+      if(fg.nextDepartISO){var dm=new Date(fg.nextDepartISO).getTime();shrs=Math.max(0,(dm-Date.now())/3600000);}
+      var sugG=suggestSpot(fg.type,shrs,isHg,fg.ident);
+      var assignedG=window._parkingAssignments&&window._parkingAssignments[_dg]?window._parkingAssignments[_dg]:sugG.spot;
+      enriched.push({f:fg,spot:assignedG,ord:spotOrder[assignedG]!==undefined?spotOrder[assignedG]:999,stayHrs:shrs,sug:sugG,safeId:_dg});
+    }
+    enriched.sort(function(a,b){return a.ord-b.ord;});
     var h='<table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px">';
     h+='<tr style="background:var(--b0);font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--t3)"><th style="padding:8px 6px;text-align:left">Tail</th><th>Type</th><th>From</th><th>On Ground</th><th>Next Dest</th><th>Departing</th><th style="min-width:90px">Parked At</th></tr>';
-    for(var i=0;i<g.length;i++){
-      var f=g[i];
-      var _depGnd=(f.ident||'').replace(/[^a-zA-Z0-9]/g,'');
-      if(window._manuallyDeparted&&window._manuallyDeparted[_depGnd])continue;
-      var fromStr=(f.from||'—')+(f.city?' <span style="color:var(--t3);font-size:9px">'+f.city+'</span>':'')+(f.country?' <span style="color:var(--red);font-size:9px">'+f.country+'</span>':'');
-      var typeStr=(f.type||'—');
+    for(var i=0;i<enriched.length;i++){
+      var en=enriched[i];
+      var f=en.f;
+      var fromStr=htmlEsc(f.from||'—')+(f.city?' <span style="color:var(--t3);font-size:9px">'+htmlEsc(f.city)+'</span>':'')+(f.country?' <span style="color:var(--red);font-size:9px">'+htmlEsc(f.country)+'</span>':'');
+      var typeStr=htmlEsc(f.type||'—');
       var mdl=MODEL[f.type]||'';
-      if(mdl)typeStr+='<br><span style="font-size:8px;color:var(--t3)">'+mdl+'</span>';
+      if(mdl)typeStr+='<br><span style="font-size:8px;color:var(--t3)">'+htmlEsc(mdl)+'</span>';
       var sinceArr=timeAgo(f.arrivedISO);
       var untilDep=f.nextDepart?timeUntil(f.nextDepartISO||''):'—';
-      var destStr=(f.nextDest||'—')+(f.nextDestCity?' <span style="font-size:9px;color:var(--t3)">'+f.nextDestCity+'</span>':'');
+      var destStr=htmlEsc(f.nextDest||'—')+(f.nextDestCity?' <span style="font-size:9px;color:var(--t3)">'+htmlEsc(f.nextDestCity)+'</span>':'');
       var bg=i%2===0?'var(--b1)':'var(--b2)';
       var depColor=f.nextDest?'var(--green)':'var(--t3)';
-      var safeId=(f.ident||'').replace(/[^a-zA-Z0-9]/g,'');
-      // Suggested spot
-      var isH=HELI[f.type]?true:false;
-      var stayHrs=24;
-      if(f.nextDepartISO){var dMs=new Date(f.nextDepartISO).getTime();stayHrs=Math.max(0,(dMs-Date.now())/3600000);}
-      var sug=suggestSpot(f.type,stayHrs,isH,f.ident);
-      var sugName=sug.spot+(sug.tow?' → '+sug.tow:'')+(sug.note?' ('+sug.note+')':'');
-      // Build dropdown
+      var safeId=en.safeId;
+      var sug=en.sug;
       var saved=window._parkingAssignments&&window._parkingAssignments[safeId]?window._parkingAssignments[safeId]:'';
       var sel='<select style="font-family:var(--mono);font-size:9px;font-weight:600;padding:2px 3px;border:1px solid var(--bd);border-radius:3px;background:var(--b1);color:var(--t1);cursor:pointer" onchange="assignParking(this.dataset.id,this.value)" data-id="'+safeId+'">';
       for(var s=0;s<spotNames.length;s++){
         var selected=(saved===spotNames[s]||(! saved&&spotNames[s]===sug.spot))?'selected':'';
         var label=spotNames[s]||'—';
-        sel+='<option value="'+spotNames[s]+'" '+selected+'>'+label+'</option>';
+        sel+='<option value="'+htmlEsc(spotNames[s])+'" '+selected+'>'+htmlEsc(label)+'</option>';
       }
       sel+='</select>';
-      h+='<tr style="background:'+bg+'"><td style="padding:7px 6px;font-weight:700;color:var(--cyan)">'+f.ident+'</td><td style="text-align:center">'+typeStr+'</td><td style="text-align:center">'+fromStr+'</td><td style="text-align:center;color:var(--amber)">'+sinceArr+'</td><td style="text-align:center">'+destStr+'</td><td style="text-align:center;color:'+depColor+'">'+untilDep+'</td><td style="text-align:center">'+sel+'</td></tr>';
+      h+='<tr style="background:'+bg+'"><td style="padding:7px 6px;font-weight:700;color:var(--cyan)">'+htmlEsc(f.ident)+'</td><td style="text-align:center">'+typeStr+'</td><td style="text-align:center">'+fromStr+'</td><td style="text-align:center;color:var(--amber)">'+htmlEsc(sinceArr)+'</td><td style="text-align:center">'+destStr+'</td><td style="text-align:center;color:'+depColor+'">'+htmlEsc(untilDep)+'</td><td style="text-align:center">'+sel+'</td></tr>';
     }
     h+='</table>';
-    tb.innerHTML=h;
+    tb.innerHTML=h;if(window.twemoji)twemoji.parse(tb);
   }).catch(function(e){document.getElementById('gnd-table').innerHTML='<p style="color:var(--red);padding:20px">Error loading data</p>';});
 }
-// Parking assignments stored in memory
+// Parking assignments stored in memory + localStorage. We restore from localStorage on init
+// so the user's manual ramp assignments survive page refresh. The ramp view's drop handler
+// writes back to localStorage on each new assignment.
 if(!window._parkingAssignments)window._parkingAssignments={};
+try{
+  var _savedPark=localStorage.getItem('skyway_parkingAssignments');
+  if(_savedPark){
+    var _parsed=JSON.parse(_savedPark);
+    if(_parsed&&typeof _parsed==='object'){
+      // SANITIZATION PASS: enforce one-plane-per-spot at load time. If localStorage was written
+      // by an older build (before the assignSpot chokepoint existed) it might contain two planes
+      // pointing at the same spot. We keep only the first occurrence and drop the rest. The
+      // dropped planes will reappear in the unassigned sidebar on next ramp render.
+      var _seenSpots={};
+      var _dropped=[];
+      for(var _pk in _parsed){
+        var _spot=_parsed[_pk];
+        if(_seenSpots[_spot]){
+          _dropped.push(_pk+'→'+_spot+' (already held by '+_seenSpots[_spot]+')');
+          continue;
+        }
+        _seenSpots[_spot]=_pk;
+        window._parkingAssignments[_pk]=_spot;
+      }
+      if(_dropped.length){
+        console.warn('[init] Dropped duplicate parking assignments from localStorage:', _dropped);
+        // Persist the cleaned-up version so the duplicates don't keep getting re-loaded
+        try{ localStorage.setItem('skyway_parkingAssignments', JSON.stringify(window._parkingAssignments)); }catch(e3){}
+      }
+    }
+  }
+}catch(_e){}
 if(!window._manuallyDeparted)window._manuallyDeparted={};
+
+// === PARKING ASSIGNMENT — single source of truth ===========================================
+// Every write to window._parkingAssignments must go through assignSpot() so we can enforce the
+// invariant: at any moment, every parking spot is occupied by AT MOST one aircraft, across every
+// view (ramp map, en-route table, departures, shift report, ground report).
+//
+// Why a chokepoint matters: the codebase has ~6 write sites (drop handler, marker drag, ADS-B
+// auto-assign, click-picker, manual-add, etc.). When each site does its own
+// _parkingAssignments[X] = Y direct write, two planes can collide on the same spot because no
+// site checks who else is there. The picker dropdown filters its choices but doesn't release
+// stale state. The drop handler overwrites without displacement. ADS-B can land on a spot a
+// human already chose. All of those produced double-occupancy in shift handoff / ground report.
+//
+// This function makes the conflict resolution explicit and consistent:
+//   1. If the spot is already held by someone else → return false (caller decides what to do)
+//   2. If the same plane is already at that spot → no-op, return true
+//   3. Otherwise → release the plane's old spot (if any), write the new mapping, sync
+//      _lastOccupied, clear any stray _manualOccupied marker, persist to localStorage
+//
+// Callers that want to FORCE displacement (e.g. user explicitly dragged here) pass force=true.
+// In that case the previous occupant gets released to the unassigned pool.
+function assignSpot(planeId, spotName, force){
+  if(!planeId || !spotName) return false;
+  if(!window._parkingAssignments) window._parkingAssignments={};
+  if(!window._lastOccupied) window._lastOccupied={};
+  // No-op: same plane already at this spot
+  if(window._parkingAssignments[planeId] === spotName){
+    window._lastOccupied[spotName] = planeId;
+    return true;
+  }
+  // Find current occupant of the destination spot (if any)
+  var currentOccupant = null;
+  for(var pid in window._parkingAssignments){
+    if(window._parkingAssignments[pid] === spotName && pid !== planeId){
+      currentOccupant = pid; break;
+    }
+  }
+  // Also check _lastOccupied as a secondary source of truth
+  if(!currentOccupant && window._lastOccupied[spotName] && window._lastOccupied[spotName] !== planeId){
+    currentOccupant = window._lastOccupied[spotName];
+  }
+  if(currentOccupant){
+    if(!force){
+      console.warn('[assignSpot] REFUSED — spot', spotName, 'already occupied by', currentOccupant, '· requested for', planeId);
+      return false;
+    }
+    // Force=true: displace the previous occupant. They go back to unassigned (their entry is
+    // removed from _parkingAssignments so they show in the sidebar on next render).
+    console.log('[assignSpot] DISPLACING', currentOccupant, 'from', spotName, 'for', planeId);
+    delete window._parkingAssignments[currentOccupant];
+  }
+  // Release this plane's previous spot if it had one
+  var oldSpot = window._parkingAssignments[planeId];
+  if(oldSpot && oldSpot !== spotName){
+    if(window._lastOccupied[oldSpot] === planeId) delete window._lastOccupied[oldSpot];
+    if(window._manualOccupied && window._manualOccupied[oldSpot]) delete window._manualOccupied[oldSpot];
+  }
+  // Write the new assignment + sync _lastOccupied
+  window._parkingAssignments[planeId] = spotName;
+  window._lastOccupied[spotName] = planeId;
+  // Clear any stale _manualOccupied 'MANUAL' marker on this spot — the spot now has a real plane
+  if(window._manualOccupied && window._manualOccupied[spotName] === 'MANUAL'){
+    delete window._manualOccupied[spotName];
+  }
+  // Persist
+  try{ localStorage.setItem('skyway_parkingAssignments', JSON.stringify(window._parkingAssignments)); }catch(e){}
+  return true;
+}
+
+// Release a plane from whatever spot it currently occupies. Called when a plane departs, when
+// the user manually marks it as unassigned, etc.
+function releaseSpot(planeId){
+  if(!planeId || !window._parkingAssignments) return;
+  var spot = window._parkingAssignments[planeId];
+  if(spot){
+    if(window._lastOccupied && window._lastOccupied[spot] === planeId) delete window._lastOccupied[spot];
+    if(window._manualOccupied && window._manualOccupied[spot]) delete window._manualOccupied[spot];
+  }
+  delete window._parkingAssignments[planeId];
+  try{ localStorage.setItem('skyway_parkingAssignments', JSON.stringify(window._parkingAssignments)); }catch(e){}
+}
+
+// Quick toast for refused assignments — user dragged onto an occupied spot.
+function showSpotConflictToast(spotName, occupantId){
+  var t=document.getElementById('spot-conflict-toast');
+  if(!t){
+    t=document.createElement('div');
+    t.id='spot-conflict-toast';
+    t.style.cssText='position:fixed;top:20px;left:50%;transform:translateX(-50%);background:#dc2626;color:#fff;padding:10px 16px;border-radius:8px;font-family:JetBrains Mono,monospace;font-size:12px;font-weight:700;box-shadow:0 4px 16px rgba(220,38,38,.4);z-index:99999;pointer-events:none;opacity:0;transition:opacity .2s';
+    document.body.appendChild(t);
+  }
+  t.textContent='⚠ '+spotName+' already occupied by '+occupantId+' — release it first';
+  t.style.opacity='1';
+  clearTimeout(window._spotToastTimer);
+  window._spotToastTimer=setTimeout(function(){t.style.opacity='0';},2800);
+}
+
 function assignParking(id,spot){
   if(!id&&this&&this.dataset)id=this.dataset.id;
-  window._parkingAssignments[id]=spot;
+  // Route through the single chokepoint. Picker dropdown already filters out occupied spots
+  // before the user clicks, so reaching this with a conflict means a race condition or stale
+  // dropdown — refuse the write and toast.
+  var ok = assignSpot(id, spot, false);
+  if(!ok){
+    var occ = window._parkingAssignments[Object.keys(window._parkingAssignments).find(function(k){return window._parkingAssignments[k]===spot;})];
+    showSpotConflictToast(spot, occ||'another plane');
+  }
 }
 function closeGround(){document.getElementById('gnd-overlay').style.display='none';}
 
 // === RAMP VIEW ===
 var rampMap=null,rampMarkers=[],rampSpotLabels=[],rampPolygons={},rampLabels={};
+
+// Build an icon spec for a plane on the ramp map, sized realistically based on its wingspan
+// in feet at the CURRENT map zoom. As the user zooms in, planes grow; as they zoom out, planes
+// shrink — they look like actual aircraft on satellite imagery rather than fixed-size symbols.
+// Info label (tail / type / model) is sized to stay legible at all zooms — clamped to a minimum
+// font size so it never disappears when zoomed out.
+function buildRampIcon(d){
+  // Convert wingspan in feet to pixels at the current map zoom.
+  // 1 foot ≈ 0.3048 meters. Leaflet at zoom z has resolution: 156543.03 / 2^z meters/pixel at equator,
+  // adjusted by latitude cos. KSFO is at ~37.6°N so we apply that cosine.
+  var ksfoLatRad=37.628*Math.PI/180;
+  var z=rampMap?rampMap.getZoom():18;
+  var metersPerPixel=156543.03392 * Math.cos(ksfoLatRad) / Math.pow(2,z);
+  var wingMeters=(d.wsFt||60)*0.3048;
+  // sz = wing-to-wing diameter in pixels at the current zoom. The SVG silhouette will fill this.
+  var sz=Math.round(wingMeters/metersPerPixel);
+  // Clamp so icons stay usable across extreme zooms. Below 14px the silhouette is unreadable;
+  // above 120px it dominates the screen.
+  if(sz<14)sz=14;
+  if(sz>120)sz=120;
+  // Label font scales gently with zoom — staff need to read tail numbers from arm's length on
+  // the ramp tablet, so we don't shrink it as aggressively as the icon.
+  var labelFont=Math.max(11,Math.min(16,Math.round(sz*0.42)));
+  var typeFont=Math.max(9,Math.min(13,Math.round(sz*0.34)));
+  var iconSvgRamp=svgIcon(d.type,280,d.col,sz,d.borderCol);
+  var badge='';
+  if(d.usedAdsb){
+    badge='<span style="font-size:8px;color:#3b82f6;background:rgba(59,130,246,.95);color:#fff;padding:1px 4px;border-radius:2px;font-weight:800;letter-spacing:.3px">ADS-B</span> ';
+  } else if(d.isManual){
+    badge='<span style="font-size:8px;color:#fff;background:rgba(59,130,246,.95);padding:1px 4px;border-radius:2px;font-weight:800;letter-spacing:.3px">MANUAL</span> ';
+  }
+  // Label uses a solid dark pill background (not just text-shadow) so it reads against any
+  // satellite imagery — buildings, concrete, asphalt, grass. This is the priority element.
+  var typeLine='';
+  if(d.type){
+    var typeText=d.type+(d.mdl?' · '+d.mdl:'');
+    typeLine='<div style="font-family:JetBrains Mono,monospace;font-size:'+typeFont+'px;font-weight:700;color:#e2e8f0;background:rgba(0,0,0,.78);padding:1px 5px;border-radius:3px;display:inline-block;margin-top:2px;white-space:nowrap;letter-spacing:.2px">'+typeText+'</div>';
+  }
+  var iconHtml=
+    '<div style="text-align:center;display:flex;flex-direction:column;align-items:center">' +
+      iconSvgRamp +
+      '<div style="margin-top:1px;display:flex;flex-direction:column;align-items:center;gap:1px">' +
+        '<div style="font-family:JetBrains Mono,monospace;font-size:'+labelFont+'px;font-weight:800;color:#fff;background:rgba(0,0,0,.85);padding:1px 6px;border-radius:3px;white-space:nowrap;letter-spacing:.3px;border:1px solid rgba(255,255,255,.2)">' + badge + d.ident + '</div>' +
+        typeLine +
+      '</div>' +
+    '</div>';
+  // Generous size box so the dark label pill isn't clipped by Leaflet's icon bounding rectangle
+  var totalW=Math.max(sz+60, 100);
+  var totalH=sz + 50;
+  return {
+    className:'',
+    html:iconHtml,
+    iconSize:[totalW,totalH],
+    iconAnchor:[totalW/2, sz/2]
+  };
+}
+
+// When the map zoom changes, walk every plane marker and rebuild its icon at the new size.
+// The zoomend event fires once after the zoom animation completes.
+function rebuildRampMarkerIcons(){
+  if(!rampMap)return;
+  for(var i=0;i<rampMarkers.length;i++){
+    var m=rampMarkers[i];
+    if(m && m._iconData){
+      try{ m.setIcon(L.divIcon(buildRampIcon(m._iconData))); }catch(e){}
+    }
+  }
+}
+
 // Spot locations on the Signature SFO ramp (lat/lng from satellite)
 var RAMP_SPOTS={
 '42 West 1':{lat:37.629350,lng:-122.388700,angle:280},
@@ -1518,6 +3479,8 @@ function showRampView(){
   if(!rampMap){
     rampMap=L.map('rampMap',{center:[37.6278,-122.3840],zoom:17,zoomControl:false,attributionControl:false});
     L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:20,maxNativeZoom:19}).addTo(rampMap);
+    // Re-render plane icons whenever the user zooms, so they scale to actual wingspan in pixels.
+    rampMap.on('zoomend',rebuildRampMarkerIcons);
     // Draw angled spot boundary polygons matching ramp orientation
     // Ramp angle ~150 degrees (NW-SE), bays perpendicular to taxilane
     var rad=120*Math.PI/180; // ramp heading in radians
@@ -1542,46 +3505,28 @@ function showRampView(){
         pt(tailTopD,tailW*0.6),pt(tailD,tailW),pt(tailD,fuseW),
         pt(wingD+5,fuseW),pt(wingD,wingW),pt(-wingD,wingW),pt(-wingD-5,fuseW)
       ];
-      L.polygon(pts,{color:col,weight:1.5,fillColor:col,fillOpacity:0.1}).addTo(rampMap);
+      // Return the polygon so caller can register it in rampPolygons for color-update pass
+      return L.polygon(pts,{color:col,weight:1,opacity:0.4,fillColor:col,fillOpacity:0.05}).addTo(rampMap);
     }
     for(var name in RAMP_SPOTS){
       var s=RAMP_SPOTS[name];
       var col='#f59e0b';
-      if(name==='Btwn Hangars 1','Btwn Hangars 2','Btwn Hangars 3','Btwn Hangars 4')col='#f59e0b';
+      if(name==='Btwn Hangars 1'||name==='Btwn Hangars 2'||name==='Btwn Hangars 3'||name==='Btwn Hangars 4')col='#f59e0b';
       else if(name.indexOf('Hangar')>=0)col='#8b5cf6';
       else if(name.indexOf('Spot')>=0||name==='Spot A')col='#3b82f6';
       else if(name.indexOf('2nd')>=0)col='#22c55e';
       else if(name.indexOf('3rd')>=0)col='#06b6d4';
       else if(name.indexOf('4th')>=0||name.indexOf('41-')>=0)col='#ef4444';
       else if(name==='Overflow 1'||name==='Overflow 2')col='#f97316';
-      else if(name==='42 West 1','42 West 2','42 West 3','42 West 4')col='#a855f7';
+      else if(name==='42 West 1'||name==='42 West 2'||name==='42 West 3'||name==='42 West 4')col='#a855f7';
       else if(name==='The Island'||name==='The Fence')col='#64748b';
       // Size bays by spot type - trapezoid: depth, noseW (narrow back), wingW (wide front)
       var depth=40,noseW=10,wingW=30;
-      if(name.indexOf('Hangar')>=0||name==='Btwn Hangars 1','Btwn Hangars 2','Btwn Hangars 3','Btwn Hangars 4'||true||name==='Spot 1'||name==='Spot 2'||name==='Spot 3'||name==='Spot 4'||name==='Spot 5'){
-        // Custom polygons drawn separately below
-      } else {
-      if(name.indexOf('Spot 1')>=0||name.indexOf('Spot 2')>=0||name==='Spot A'){depth=35;noseW=8;wingW=22;}
-      else if(name.indexOf('Spot 3')>=0){depth=40;noseW=10;wingW=28;}
-      else if(name.indexOf('Spot 4')>=0||name.indexOf('Spot 5')>=0){depth=45;noseW=12;wingW=42;}
-      else if(name==='42 West 1','42 West 2','42 West 3','42 West 4'){depth=0;noseW=0;wingW=0;} // custom polygon drawn separately
-      else if(name.indexOf('4th')>=0||name.indexOf('41-')>=0){depth=50;noseW=14;wingW=45;}
-      else if(name==='The Island'){depth=48;noseW=12;wingW=42;}
-      else if(name.indexOf('Overflow')>=0){depth=45;noseW=12;wingW=40;}
-      else if(name==='Btwn Hangars 1','Btwn Hangars 2','Btwn Hangars 3','Btwn Hangars 4'){depth=0;noseW=0;wingW=0;} // custom polygon drawn separately
-      else if(name==='The Shop'||name.indexOf('AFS')>=0||name.indexOf('Airfield')>=0){depth=45;noseW=12;wingW=40;}
-      else if(name.indexOf('2nd')>=0){depth=40;noseW=10;wingW=28;}
-      else if(name.indexOf('3rd')>=0){depth=40;noseW=10;wingW=28;}
-      else if(name==='The Fence'){depth=35;noseW=8;wingW=22;}
-      else if(name==='Ken Salvage'||name.indexOf('KenS')>=0){depth=40;noseW=10;wingW=28;}
-      var fm=1.25,bm=1.15;
-      if(name.indexOf('Spot 1')>=0||name.indexOf('Spot 2')>=0)bm=1.10;
-      else if(name.indexOf('Spot 4')>=0||name.indexOf('Spot 5')>=0)bm=1.20;
-      else if(name.indexOf('4th')>=0||name.indexOf('41-')>=0)bm=1.20;
-      bayPoly(s.lat,s.lng,depth,noseW,wingW,col,fm,bm,name);
-      }
-      var shortName=name.replace('Airfield Safety','AFS').replace('Ken Salvage','KenS').replace('Btwn Hangars 1','Btwn Hangars 2','Btwn Hangars 3','Btwn Hangars 4','Btwn Hngrs');
-      var lbl=L.marker([s.lat,s.lng],{interactive:true,icon:L.divIcon({className:'',html:'<div id="rl_'+name.replace(/[^a-zA-Z0-9]/g,'')+'" style="font-family:monospace;font-size:8px;font-weight:800;color:#22c55e;background:rgba(0,0,0,.75);padding:1px 5px;border-radius:3px;white-space:nowrap;text-align:center">'+shortName+'</div>',iconSize:[80,14],iconAnchor:[40,7]})}).addTo(rampMap);
+      // ALL spots now use custom polygons drawn separately below (no more bayPoly silhouettes).
+      // The color-recolor pass finds each polygon via rampPolygons[name] which is populated below.
+      var shortName=name.replace('Airfield Safety','AFS').replace('Ken Salvage','KenS');
+      if(name==='Btwn Hangars 1'||name==='Btwn Hangars 2'||name==='Btwn Hangars 3'||name==='Btwn Hangars 4')shortName='Btwn Hngrs';
+      var lbl=L.marker([s.lat,s.lng],{interactive:true,icon:L.divIcon({className:'',html:'<div id="rl_'+name.replace(/[^a-zA-Z0-9]/g,'')+'" style="font-family:monospace;font-size:7px;font-weight:600;color:rgba(34,197,94,.85);background:rgba(0,0,0,.45);padding:1px 4px;border-radius:2px;white-space:nowrap;text-align:center;letter-spacing:.2px">'+shortName+'</div>',iconSize:[80,12],iconAnchor:[40,6]})}).addTo(rampMap);
       rampSpotLabels.push(lbl);
       if(!window._rampLabelMarkers)window._rampLabelMarkers={};
       window._rampLabelMarkers[name]=lbl;
@@ -1598,120 +3543,117 @@ function showRampView(){
       rampLabels[name]=name.replace(/[^a-zA-Z0-9]/g,'');
     }
     // Custom polygons for specific spots
-    // 42 West - custom boundary
+    // 42 West - custom boundary (single physical row, 4 sub-spot labels share this polygon)
     var _p42West=L.polygon([
       [37.629010,-122.388984],[37.629537,-122.388568],
       [37.629174,-122.387716],[37.628652,-122.388048]
-    ],{color:'#a855f7',weight:2,fillColor:'#a855f7',fillOpacity:0.08}).addTo(rampMap);rampPolygons['42 West 1','42 West 2','42 West 3','42 West 4']=_p42West;
-    // Between Hangars - custom boundary
+    ],{color:'#a855f7',weight:1,opacity:0.4,fillColor:'#a855f7',fillOpacity:0.05}).addTo(rampMap);
+    rampPolygons['42 West 1']=_p42West;
+    rampPolygons['42 West 2']=_p42West;
+    rampPolygons['42 West 3']=_p42West;
+    rampPolygons['42 West 4']=_p42West;
+    // Between Hangars - custom boundary (single stretch, 4 sub-spot labels share this polygon)
     var _pBtwnHangars=L.polygon([
       [37.628872,-122.387839],[37.628620,-122.388037],
       [37.627600,-122.385645],[37.627848,-122.385444]
-    ],{color:'#f59e0b',weight:2,fillColor:'#f59e0b',fillOpacity:0.08}).addTo(rampMap);rampPolygons['Btwn Hangars 1','Btwn Hangars 2','Btwn Hangars 3','Btwn Hangars 4']=_pBtwnHangars;
+    ],{color:'#f59e0b',weight:1,opacity:0.4,fillColor:'#f59e0b',fillOpacity:0.05}).addTo(rampMap);
+    rampPolygons['Btwn Hangars 1']=_pBtwnHangars;
+    rampPolygons['Btwn Hangars 2']=_pBtwnHangars;
+    rampPolygons['Btwn Hangars 3']=_pBtwnHangars;
+    rampPolygons['Btwn Hangars 4']=_pBtwnHangars;
     // Hangar B - custom boundary
     var _pHangarB=L.polygon([
       [37.629083,-122.387515],[37.628863,-122.387665],
       [37.628546,-122.386927],[37.628769,-122.386773]
-    ],{color:'#8b5cf6',weight:2,fillColor:'#8b5cf6',fillOpacity:0.1}).addTo(rampMap);rampPolygons['Hangar B']=_pHangarB;
+    ],{color:'#8b5cf6',weight:1,opacity:0.4,fillColor:'#8b5cf6',fillOpacity:0.05}).addTo(rampMap);rampPolygons['Hangar B']=_pHangarB;
     // Hangar C - custom boundary
     var _pHangarC=L.polygon([
       [37.628477,-122.386187],[37.628248,-122.386333],
       [37.627982,-122.385700],[37.628205,-122.385544]
-    ],{color:'#8b5cf6',weight:2,fillColor:'#8b5cf6',fillOpacity:0.1}).addTo(rampMap);rampPolygons['Hangar C']=_pHangarC;
+    ],{color:'#8b5cf6',weight:1,opacity:0.4,fillColor:'#8b5cf6',fillOpacity:0.05}).addTo(rampMap);rampPolygons['Hangar C']=_pHangarC;
     // Hangar A - custom boundary
     var _pHangarA=L.polygon([
       [37.628572,-122.384067],[37.628330,-122.383919],
       [37.628613,-122.383134],[37.628854,-122.383262]
-    ],{color:'#8b5cf6',weight:2,fillColor:'#8b5cf6',fillOpacity:0.1}).addTo(rampMap);rampPolygons['Hangar A']=_pHangarA;
+    ],{color:'#8b5cf6',weight:1,opacity:0.4,fillColor:'#8b5cf6',fillOpacity:0.05}).addTo(rampMap);rampPolygons['Hangar A']=_pHangarA;
     // The Island - custom boundary
     var _pTheIsland=L.polygon([
       [37.627782,-122.385426],[37.627610,-122.385536],
       [37.627525,-122.385275],[37.627719,-122.385216]
-    ],{color:'#64748b',weight:2,fillColor:'#64748b',fillOpacity:0.1}).addTo(rampMap);rampPolygons['The Island']=_pTheIsland;
+    ],{color:'#64748b',weight:1,opacity:0.4,fillColor:'#64748b',fillOpacity:0.05}).addTo(rampMap);rampPolygons['The Island']=_pTheIsland;
     // The Fence - custom boundary
     var _pTheFence=L.polygon([
       [37.627811,-122.385142],[37.627722,-122.385190],
       [37.627668,-122.385064],[37.627777,-122.384990]
-    ],{color:'#64748b',weight:2,fillColor:'#64748b',fillOpacity:0.1}).addTo(rampMap);rampPolygons['The Fence']=_pTheFence;
+    ],{color:'#64748b',weight:1,opacity:0.4,fillColor:'#64748b',fillOpacity:0.05}).addTo(rampMap);rampPolygons['The Fence']=_pTheFence;
     // Spot A - custom boundary
     var _pSpotA=L.polygon([
       [37.628326,-122.383791],[37.628280,-122.383674],
       [37.628184,-122.383727],[37.628233,-122.383840]
-    ],{color:'#3b82f6',weight:2,fillColor:'#3b82f6',fillOpacity:0.1}).addTo(rampMap);rampPolygons['Spot A']=_pSpotA;
+    ],{color:'#3b82f6',weight:1,opacity:0.4,fillColor:'#3b82f6',fillOpacity:0.05}).addTo(rampMap);rampPolygons['Spot A']=_pSpotA;
 
-
-    // Spot 1 - aircraft-shaped bay
-    L.polygon([[37.628157,-122.384169],[37.628119,-122.384197],[37.628038,-122.384167],[37.628038,-122.384035],[37.628086,-122.384000],[37.628176,-122.384066]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
-    // Spot 2 - aircraft-shaped bay
-    L.polygon([[37.628030,-122.384237],[37.627992,-122.384265],[37.627911,-122.384235],[37.627911,-122.384103],[37.627959,-122.384068],[37.628049,-122.384134]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
-    // Spot 3 - aircraft-shaped bay
-    L.polygon([[37.627832,-122.384364],[37.627794,-122.384392],[37.627686,-122.384358],[37.627693,-122.384185],[37.627741,-122.384150],[37.627862,-122.384229]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
-    // Spot 4 - aircraft-shaped bay
-    L.polygon([[37.627663,-122.384609],[37.627625,-122.384637],[37.627463,-122.384595],[37.627482,-122.384340],[37.627530,-122.384305],[37.627715,-122.384411]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
-    // Spot 5 - aircraft-shaped bay
-    L.polygon([[37.627421,-122.384794],[37.627383,-122.384822],[37.627221,-122.384780],[37.627240,-122.384525],[37.627288,-122.384490],[37.627473,-122.384596]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
 
     // Spot 1
-    var _psSpot1=L.polygon([[37.628157,-122.384169],[37.628119,-122.384197],[37.628038,-122.384167],[37.628038,-122.384035],[37.628086,-122.384000],[37.628176,-122.384066]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);rampPolygons['Spot 1']=_psSpot1;
+    var _psSpot1=L.polygon([[37.628157,-122.384169],[37.628119,-122.384197],[37.628038,-122.384167],[37.628038,-122.384035],[37.628086,-122.384000],[37.628176,-122.384066]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);rampPolygons['Spot 1']=_psSpot1;
     // Spot 2
-    var _psSpot2=L.polygon([[37.627989,-122.384254],[37.627951,-122.384282],[37.627870,-122.384252],[37.627870,-122.384120],[37.627918,-122.384085],[37.628008,-122.384151]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);rampPolygons['Spot 2']=_psSpot2;
+    var _psSpot2=L.polygon([[37.627989,-122.384254],[37.627951,-122.384282],[37.627870,-122.384252],[37.627870,-122.384120],[37.627918,-122.384085],[37.628008,-122.384151]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);rampPolygons['Spot 2']=_psSpot2;
     // Spot 3
-    var _psSpot3=L.polygon([[37.627832,-122.384364],[37.627794,-122.384392],[37.627686,-122.384358],[37.627693,-122.384185],[37.627741,-122.384150],[37.627862,-122.384229]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);rampPolygons['Spot 3']=_psSpot3;
+    var _psSpot3=L.polygon([[37.627832,-122.384364],[37.627794,-122.384392],[37.627686,-122.384358],[37.627693,-122.384185],[37.627741,-122.384150],[37.627862,-122.384229]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);rampPolygons['Spot 3']=_psSpot3;
     // Spot 4
-    var _psSpot4=L.polygon([[37.627663,-122.384609],[37.627625,-122.384637],[37.627463,-122.384595],[37.627482,-122.384340],[37.627530,-122.384305],[37.627715,-122.384411]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);rampPolygons['Spot 4']=_psSpot4;
+    var _psSpot4=L.polygon([[37.627663,-122.384609],[37.627625,-122.384637],[37.627463,-122.384595],[37.627482,-122.384340],[37.627530,-122.384305],[37.627715,-122.384411]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);rampPolygons['Spot 4']=_psSpot4;
     // Spot 5
-    var _psSpot5=L.polygon([[37.627421,-122.384794],[37.627383,-122.384822],[37.627221,-122.384780],[37.627240,-122.384525],[37.627288,-122.384490],[37.627473,-122.384596]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);rampPolygons['Spot 5']=_psSpot5;
+    var _psSpot5=L.polygon([[37.627421,-122.384794],[37.627383,-122.384822],[37.627221,-122.384780],[37.627240,-122.384525],[37.627288,-122.384490],[37.627473,-122.384596]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);rampPolygons['Spot 5']=_psSpot5;
 
     // 2nd Line 1
-    L.polygon([[37.627615,-122.383706],[37.627577,-122.383734],[37.627469,-122.383700],[37.627476,-122.383527],[37.627524,-122.383492],[37.627645,-122.383571]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['2nd Line 1']=L.polygon([[37.627615,-122.383706],[37.627577,-122.383734],[37.627469,-122.383700],[37.627476,-122.383527],[37.627524,-122.383492],[37.627645,-122.383571]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // 2nd Line 2
-    L.polygon([[37.627809,-122.383584],[37.627771,-122.383612],[37.627663,-122.383578],[37.627670,-122.383405],[37.627718,-122.383370],[37.627839,-122.383449]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['2nd Line 2']=L.polygon([[37.627809,-122.383584],[37.627771,-122.383612],[37.627663,-122.383578],[37.627670,-122.383405],[37.627718,-122.383370],[37.627839,-122.383449]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // 2nd Line 3
-    L.polygon([[37.628003,-122.383465],[37.627965,-122.383493],[37.627857,-122.383459],[37.627864,-122.383286],[37.627912,-122.383251],[37.628033,-122.383330]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['2nd Line 3']=L.polygon([[37.628003,-122.383465],[37.627965,-122.383493],[37.627857,-122.383459],[37.627864,-122.383286],[37.627912,-122.383251],[37.628033,-122.383330]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // 2nd Line 4
-    L.polygon([[37.628156,-122.383314],[37.628118,-122.383342],[37.628010,-122.383308],[37.628017,-122.383135],[37.628065,-122.383100],[37.628186,-122.383179]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['2nd Line 4']=L.polygon([[37.628156,-122.383314],[37.628118,-122.383342],[37.628010,-122.383308],[37.628017,-122.383135],[37.628065,-122.383100],[37.628186,-122.383179]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // Overflow 1
-    L.polygon([[37.627155,-122.384064],[37.627117,-122.384092],[37.626955,-122.384050],[37.626974,-122.383795],[37.627022,-122.383760],[37.627207,-122.383866]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['Overflow 1']=L.polygon([[37.627155,-122.384064],[37.627117,-122.384092],[37.626955,-122.384050],[37.626974,-122.383795],[37.627022,-122.383760],[37.627207,-122.383866]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // Overflow 2
-    L.polygon([[37.627367,-122.383880],[37.627329,-122.383908],[37.627167,-122.383866],[37.627186,-122.383611],[37.627234,-122.383576],[37.627419,-122.383682]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['Overflow 2']=L.polygon([[37.627367,-122.383880],[37.627329,-122.383908],[37.627167,-122.383866],[37.627186,-122.383611],[37.627234,-122.383576],[37.627419,-122.383682]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // 3rd Line 1
-    L.polygon([[37.627347,-122.383146],[37.627309,-122.383174],[37.627201,-122.383140],[37.627208,-122.382967],[37.627256,-122.382932],[37.627377,-122.383011]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['3rd Line 1']=L.polygon([[37.627347,-122.383146],[37.627309,-122.383174],[37.627201,-122.383140],[37.627208,-122.382967],[37.627256,-122.382932],[37.627377,-122.383011]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // 3rd Line 2
-    L.polygon([[37.627559,-122.383028],[37.627521,-122.383056],[37.627413,-122.383022],[37.627420,-122.382849],[37.627468,-122.382814],[37.627589,-122.382893]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['3rd Line 2']=L.polygon([[37.627559,-122.383028],[37.627521,-122.383056],[37.627413,-122.383022],[37.627420,-122.382849],[37.627468,-122.382814],[37.627589,-122.382893]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // 3rd Line 3
-    L.polygon([[37.627738,-122.382923],[37.627700,-122.382951],[37.627592,-122.382917],[37.627599,-122.382744],[37.627647,-122.382709],[37.627768,-122.382788]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['3rd Line 3']=L.polygon([[37.627738,-122.382923],[37.627700,-122.382951],[37.627592,-122.382917],[37.627599,-122.382744],[37.627647,-122.382709],[37.627768,-122.382788]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // 3rd Line 4
-    L.polygon([[37.627914,-122.382760],[37.627876,-122.382788],[37.627768,-122.382754],[37.627775,-122.382581],[37.627823,-122.382546],[37.627944,-122.382625]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['3rd Line 4']=L.polygon([[37.627914,-122.382760],[37.627876,-122.382788],[37.627768,-122.382754],[37.627775,-122.382581],[37.627823,-122.382546],[37.627944,-122.382625]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // 3rd Line 5
-    L.polygon([[37.628105,-122.382639],[37.628067,-122.382667],[37.627959,-122.382633],[37.627966,-122.382460],[37.628014,-122.382425],[37.628135,-122.382504]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['3rd Line 5']=L.polygon([[37.628105,-122.382639],[37.628067,-122.382667],[37.627959,-122.382633],[37.627966,-122.382460],[37.628014,-122.382425],[37.628135,-122.382504]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // 3rd Line 6
-    L.polygon([[37.628291,-122.382515],[37.628253,-122.382543],[37.628145,-122.382509],[37.628152,-122.382336],[37.628200,-122.382301],[37.628321,-122.382380]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['3rd Line 6']=L.polygon([[37.628291,-122.382515],[37.628253,-122.382543],[37.628145,-122.382509],[37.628152,-122.382336],[37.628200,-122.382301],[37.628321,-122.382380]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // 3rd Line 7
-    L.polygon([[37.628494,-122.382381],[37.628456,-122.382409],[37.628348,-122.382375],[37.628355,-122.382202],[37.628403,-122.382167],[37.628524,-122.382246]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['3rd Line 7']=L.polygon([[37.628494,-122.382381],[37.628456,-122.382409],[37.628348,-122.382375],[37.628355,-122.382202],[37.628403,-122.382167],[37.628524,-122.382246]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // 3rd Line 8
-    L.polygon([[37.628690,-122.382293],[37.628652,-122.382321],[37.628544,-122.382287],[37.628551,-122.382114],[37.628599,-122.382079],[37.628720,-122.382158]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['3rd Line 8']=L.polygon([[37.628690,-122.382293],[37.628652,-122.382321],[37.628544,-122.382287],[37.628551,-122.382114],[37.628599,-122.382079],[37.628720,-122.382158]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // The Shop
-    L.polygon([[37.629031,-122.382245],[37.628993,-122.382273],[37.628845,-122.382228],[37.628857,-122.381991],[37.628905,-122.381956],[37.629074,-122.382062]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['The Shop']=L.polygon([[37.629031,-122.382245],[37.628993,-122.382273],[37.628845,-122.382228],[37.628857,-122.381991],[37.628905,-122.381956],[37.629074,-122.382062]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // Airfield Safety 1
-    L.polygon([[37.629414,-122.382246],[37.629376,-122.382274],[37.629214,-122.382232],[37.629233,-122.381977],[37.629281,-122.381942],[37.629466,-122.382048]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['Airfield Safety 1']=L.polygon([[37.629414,-122.382246],[37.629376,-122.382274],[37.629214,-122.382232],[37.629233,-122.381977],[37.629281,-122.381942],[37.629466,-122.382048]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // Airfield Safety 2
-    L.polygon([[37.629342,-122.382023],[37.629304,-122.382051],[37.629142,-122.382009],[37.629161,-122.381754],[37.629209,-122.381719],[37.629394,-122.381825]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['Airfield Safety 2']=L.polygon([[37.629342,-122.382023],[37.629304,-122.382051],[37.629142,-122.382009],[37.629161,-122.381754],[37.629209,-122.381719],[37.629394,-122.381825]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // Ken Salvage
-    L.polygon([[37.628434,-122.383182],[37.628396,-122.383210],[37.628288,-122.383176],[37.628295,-122.383003],[37.628343,-122.382968],[37.628464,-122.383047]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['Ken Salvage']=L.polygon([[37.628434,-122.383182],[37.628396,-122.383210],[37.628288,-122.383176],[37.628295,-122.383003],[37.628343,-122.382968],[37.628464,-122.383047]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // 4th Line 1
-    L.polygon([[37.627267,-122.381875],[37.627229,-122.381903],[37.627067,-122.381861],[37.627086,-122.381606],[37.627134,-122.381571],[37.627319,-122.381677]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['4th Line 1']=L.polygon([[37.627267,-122.381875],[37.627229,-122.381903],[37.627067,-122.381861],[37.627086,-122.381606],[37.627134,-122.381571],[37.627319,-122.381677]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // 4th Line 2
-    L.polygon([[37.627727,-122.381614],[37.627689,-122.381642],[37.627527,-122.381600],[37.627546,-122.381345],[37.627594,-122.381310],[37.627779,-122.381416]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['4th Line 2']=L.polygon([[37.627727,-122.381614],[37.627689,-122.381642],[37.627527,-122.381600],[37.627546,-122.381345],[37.627594,-122.381310],[37.627779,-122.381416]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // 4th Line 3
-    L.polygon([[37.628188,-122.381354],[37.628150,-122.381382],[37.627988,-122.381340],[37.628007,-122.381085],[37.628055,-122.381050],[37.628240,-122.381156]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['4th Line 3']=L.polygon([[37.628188,-122.381354],[37.628150,-122.381382],[37.627988,-122.381340],[37.628007,-122.381085],[37.628055,-122.381050],[37.628240,-122.381156]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // 4th Line 4
-    L.polygon([[37.628648,-122.381093],[37.628610,-122.381121],[37.628448,-122.381079],[37.628467,-122.380824],[37.628515,-122.380789],[37.628700,-122.380895]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['4th Line 4']=L.polygon([[37.628648,-122.381093],[37.628610,-122.381121],[37.628448,-122.381079],[37.628467,-122.380824],[37.628515,-122.380789],[37.628700,-122.380895]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // 41-7 A
-    L.polygon([[37.626466,-122.382415],[37.626428,-122.382443],[37.626249,-122.382397],[37.626272,-122.382116],[37.626320,-122.382081],[37.626525,-122.382196]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['41-7 A']=L.polygon([[37.626466,-122.382415],[37.626428,-122.382443],[37.626249,-122.382397],[37.626272,-122.382116],[37.626320,-122.382081],[37.626525,-122.382196]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // 41-7 B
-    L.polygon([[37.626343,-122.382119],[37.626305,-122.382147],[37.626126,-122.382101],[37.626149,-122.381820],[37.626197,-122.381785],[37.626402,-122.381900]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['41-7 B']=L.polygon([[37.626343,-122.382119],[37.626305,-122.382147],[37.626126,-122.382101],[37.626149,-122.381820],[37.626197,-122.381785],[37.626402,-122.381900]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // 41-11
-    L.polygon([[37.626598,-122.381898],[37.626560,-122.381926],[37.626398,-122.381884],[37.626417,-122.381629],[37.626465,-122.381594],[37.626650,-122.381700]],{color:'#22c55e',weight:1.5,fillColor:'#22c55e',fillOpacity:0.08}).addTo(rampMap);
+    rampPolygons['41-11']=L.polygon([[37.626598,-122.381898],[37.626560,-122.381926],[37.626398,-122.381884],[37.626417,-122.381629],[37.626465,-122.381594],[37.626650,-122.381700]],{color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.05}).addTo(rampMap);
     // Draw group area outlines for visual clarity
     // First Line outline
     L.polyline([[37.627326,-122.384643],[37.627568,-122.384458],[37.627760,-122.384262],[37.627969,-122.384160],[37.628096,-122.384092],[37.628255,-122.383750]],{color:'#3b82f6',weight:1,opacity:0.4,dashArray:'6,4'}).addTo(rampMap);
@@ -1733,35 +3675,170 @@ function loadRampPlanes(){
   // Clear old markers
   for(var i=0;i<rampMarkers.length;i++)rampMap.removeLayer(rampMarkers[i]);
   rampMarkers=[];
-  fetch('/fa/ground').then(function(r){return r.json();}).then(function(g){
+  // Fetch ground aircraft AND live OpenSky positions (very tight bbox around FBO)
+  // FBO is at 37.628, -122.384 - use ~2 mile bbox
+  var rampBBox='lamin=37.615&lomin=-122.400&lamax=37.645&lomax=-122.368';
+  Promise.all([
+    fetch('/fa/ground').then(function(r){return r.json();}),
+    fetch('/osky/states/all?extended=1&'+rampBBox,{cache:'no-cache'}).then(function(r){return r.json();}).catch(function(){return{states:[]};})
+  ]).then(function(results){
+    var g=results[0]||[];
+    var osky=results[1];
+    // Inject manual planes (added via "+ Add Plane" lookup) into the list
+    if(window._manualPlanes){
+      for(var mpk in window._manualPlanes){
+        var mp=window._manualPlanes[mpk];
+        if(!mp||!mp.ident)continue;
+        var mpIdent=safeStr(mp.ident).toUpperCase();
+        // Skip if already in FA ground results
+        var already=false;
+        for(var gi=0;gi<g.length;gi++){
+          if(g[gi]&&g[gi].ident&&safeStr(g[gi].ident).toUpperCase()===mpIdent){already=true;break;}
+        }
+        if(already)continue;
+        g.push({ident:mp.ident,type:mp.type||'',from:'',to:'',manualAdded:true});
+      }
+    }
     if(!g||!g.length)return;
+    // Build map of tail/callsign -> live position from OpenSky
+    var livePositions={};
+    if(osky&&osky.states){
+      for(var oi=0;oi<osky.states.length;oi++){
+        var s=osky.states[oi];
+        var cs=(s[1]||'').trim().toUpperCase().replace(/[^A-Z0-9]/g,'');
+        if(!cs)continue;
+        var oLat=s[6],oLon=s[5],gnd=s[8];
+        if(!oLat||!oLon)continue;
+        // Only count ground aircraft OR very low altitude
+        if(gnd||(s[7]!=null&&s[7]<50)){
+          livePositions[cs]={lat:oLat,lng:oLon};
+        }
+      }
+    }
+    // Track which spots are taken (by live ADS-B position)
+    var spotsByAdsb={};
+    // Track which spots actually get rendered with a plane marker (for truthful occupancy)
+    var renderedSpots={};
+    // NEW: planes we couldn't confidently place — they go to the "Unassigned" sidebar so the
+    // user can manually drag them onto a spot. Only planes with manual assignment OR confirmed
+    // ADS-B-nearest-spot match get auto-placed on the map. Algorithmic guesses are no longer
+    // dropped onto random spots.
+    var unassignedPlanes=[];
     for(var i=0;i<g.length;i++){
       var f=g[i];
       var safeId=(f.ident||'').replace(/[^a-zA-Z0-9]/g,'');
       if(window._manuallyDeparted&&window._manuallyDeparted[safeId])continue;
-      // Determine spot - use manual assignment or suggestion
-      var assigned=window._parkingAssignments&&window._parkingAssignments[safeId]?window._parkingAssignments[safeId]:'';
+      // Priority 1: manual assignment
+      var manualSpot=window._parkingAssignments&&window._parkingAssignments[safeId]?window._parkingAssignments[safeId]:'';
+      var spotName='';
+      var jLat=0,jLng=0;
+      var usedAdsb=false;
+      if(manualSpot){
+        spotName=manualSpot;
+        var sp=RAMP_SPOTS[spotName];
+        if(sp){jLat=sp.lat;jLng=sp.lng;}
+      } else {
+        // Priority 2: ADS-B live position → nearest spot (high confidence only)
+        var adsbKey=safeId.toUpperCase();
+        var livePos=livePositions[adsbKey];
+        if(!livePos&&f.callsign){
+          var cKey=safeStr(f.callsign).toUpperCase().replace(/[^A-Z0-9]/g,'');
+          livePos=livePositions[cKey];
+        }
+        if(livePos){
+          // Find nearest spot to ADS-B position
+          var nearest='',minD=9999;
+          for(var sn in RAMP_SPOTS){
+            var sp2=RAMP_SPOTS[sn];
+            var dd=Math.sqrt(Math.pow(livePos.lat-sp2.lat,2)+Math.pow(livePos.lng-sp2.lng,2));
+            if(dd<minD){minD=dd;nearest=sn;}
+          }
+          // Only accept if within ~300ft (0.001 deg ≈ 365ft)
+          if(nearest&&minD<0.0015&&!spotsByAdsb[nearest]){
+            // Try to claim the spot via the chokepoint. force=false because ADS-B is approximate
+            // (~365ft tolerance) and a manual human assignment is more authoritative. If the spot
+            // already belongs to someone else, this returns false and we route the plane to the
+            // unassigned sidebar (the same code path that catches every "no confident placement"
+            // case below).
+            var claimed = assignSpot(safeId, nearest, false);
+            if(claimed){
+              spotName=nearest;
+              jLat=livePos.lat;
+              jLng=livePos.lng;
+              spotsByAdsb[nearest]=safeId;
+              usedAdsb=true;
+            }
+          }
+        }
+      }
+      // No confident placement: route to UNASSIGNED sidebar instead of guessing.
+      // The user will drag from the sidebar onto a spot. That drop writes to _parkingAssignments
+      // which then propagates to the en-route table, departures table, and shift report.
+      if(!spotName){
+        // Capture wingspan and arrival timestamp so the sidebar can sort by size+recency.
+        // Wingspan: from SPAN lookup table; falls back to a sensible default if type unknown.
+        // Arrival timestamp: prefer FA's actual_on (wheels touched down); fall back to scheduled
+        // arrival; missing values sort last.
+        var ws=SPAN[f.type]||0;
+        var arrIso=f.actual_on||f.actualOnISO||f.arriveISO||f.arrive_iso||'';
+        var arrMs=arrIso?new Date(arrIso).getTime():0;
+        unassignedPlanes.push({
+          ident: f.ident||'?',
+          safeId: safeId,
+          type: f.type||'',
+          callsign: f.callsign||'',
+          from: f.from||'',
+          isHeli: HELI[f.type]?true:false,
+          wingspan: ws,
+          arrMs: arrMs||0
+        });
+        continue; // skip placing a marker on the map
+      }
       var isH=HELI[f.type]?true:false;
-      var sug=suggestSpot(f.type,24,isH,f.ident);
-      var spotName=assigned||sug.spot;
-      var spotPos=RAMP_SPOTS[spotName];
-      if(!spotPos)spotPos={lat:37.6234,lng:-122.3815,angle:0};
-      // Add slight offset to prevent stacking
-      var jLat=spotPos.lat+(Math.random()-0.5)*0.00008;
-      var jLng=spotPos.lng+(Math.random()-0.5)*0.00008;
-      // Aircraft icon - scaled by wingspan category
-      var cat=getWsCat(f.type);
-      var sz=cat<=2?20:cat<=3?28:cat<=5?36:44;
       var mdl=MODEL[f.type]||'';
-      var ws=SPAN[f.type]||60;
+      var wsFt=SPAN[f.type]||60; // wingspan in feet — drives realistic on-map sizing
       var col=isH?'#22c55e':'#f59e0b';
-      var svgPath='M12 2C12.3 2 12.5 3 12.6 4.5L12.8 7.5L18 11C18.4 11.2 18.4 11.6 18 11.8L12.8 10.5L12.9 17L14.8 18.8C15 19 15 19.3 14.8 19.5L12 18.5L9.2 19.5C9 19.3 9 19 9.2 18.8L11.1 17L11.2 10.5L6 11.8C5.6 11.6 5.6 11.2 6 11L11.2 7.5L11.4 4.5C11.5 3 11.7 2 12 2Z';
-      if(isH)svgPath='M12 4L14 8L20 9L14 12L14 18L17 20L12 19L7 20L10 18L10 12L4 9L10 8Z';
-      var iconHtml='<div style="text-align:center"><svg width="'+sz+'" height="'+sz+'" viewBox="0 0 24 24" style="transform:rotate(280deg);filter:drop-shadow(0 1px 3px rgba(0,0,0,.5))"><path d="'+svgPath+'" fill="'+col+'" stroke="#fff" stroke-width="1"/></svg><div style="font-family:monospace;font-size:8px;font-weight:800;color:#fff;text-shadow:0 0 3px #000,0 0 3px #000;white-space:nowrap;margin-top:-2px">'+(f.ident||'?')+'</div><div style="font-family:monospace;font-size:6px;color:#ccc;text-shadow:0 0 2px #000;white-space:nowrap">'+(f.type||'')+(mdl?' '+mdl:'')+'</div></div>';
-      var icon=L.divIcon({className:'',html:iconHtml,iconSize:[sz+40,sz+20],iconAnchor:[(sz+40)/2,(sz+20)/2]});
+      // Add blue border if position came from live ADS-B (high confidence)
+      var borderCol=usedAdsb?'#3b82f6':'#fff';
+      // Build icon data for the marker. The actual SVG + label HTML is regenerated whenever the
+      // map zooms (so plane size grows with zoom, like a real overhead photo). We store the raw
+      // info on the marker so the zoom handler can rebuild the icon HTML at the new size.
+      var iconData={
+        wsFt:wsFt,
+        type:f.type||'',
+        ident:f.ident||'?',
+        callsign:f.callsign||'',
+        col:col,
+        borderCol:borderCol,
+        usedAdsb:usedAdsb,
+        mdl:mdl,
+        isHeli:isH
+      };
+      // Compute initial pixel size for current zoom
+      var iconSpec=buildRampIcon(iconData);
+      var icon=L.divIcon(iconSpec);
       var m=L.marker([jLat,jLng],{icon:icon,draggable:true}).addTo(rampMap);
       m._planeId=safeId;
       m._planeName=f.ident;
+      m._iconData=iconData; // stash so zoomend handler can rebuild
+      // Source spot is whatever we placed at — definitely a real spot now (no algorithmic guesses)
+      m._sourceSpot=spotName;
+      m.on('dragstart',function(e){
+        // Capture the spot the plane is leaving
+        var pid=e.target._planeId;
+        // Find which spot this plane is currently in
+        var fromSpot=null;
+        if(window._parkingAssignments&&window._parkingAssignments[pid]){
+          fromSpot=window._parkingAssignments[pid];
+        }
+        if(!fromSpot&&window._lastOccupied){
+          for(var sk in window._lastOccupied){
+            if(window._lastOccupied[sk]===pid){fromSpot=sk;break;}
+          }
+        }
+        if(!fromSpot)fromSpot=e.target._sourceSpot;
+        e.target._fromSpot=fromSpot;
+      });
       // On drag end, find nearest spot and assign
       m.on('dragend',function(e){
         var pos=e.target.getLatLng();
@@ -1772,37 +3849,122 @@ function loadRampPlanes(){
           if(d<minDist){minDist=d;nearest=sn;}
         }
         if(nearest){
-          if(!window._parkingAssignments)window._parkingAssignments={};
-          window._parkingAssignments[e.target._planeId]=nearest;
-          // Snap to spot
-          var sp2=RAMP_SPOTS[nearest];
-          e.target.setLatLng([sp2.lat,sp2.lng]);
-          // Immediately update occupancy colors
-          if(!window._lastOccupied)window._lastOccupied={};
-          window._lastOccupied[nearest]=e.target._planeId;
-          updateRampColors();
+          var pid=e.target._planeId;
+          // Route through assignSpot. force=false so dragging onto an occupied spot is REFUSED
+          // (rather than silently displacing the existing occupant). On refusal we snap the
+          // marker back to its source spot and toast the user.
+          var ok = assignSpot(pid, nearest, false);
+          if(!ok){
+            // Snap back to source spot
+            var srcSpot = e.target._fromSpot || e.target._sourceSpot;
+            var srcSp = srcSpot ? RAMP_SPOTS[srcSpot] : null;
+            if(srcSp) e.target.setLatLng([srcSp.lat, srcSp.lng]);
+            // Find current occupant for the toast
+            var occId='';
+            for(var pa in window._parkingAssignments){
+              if(window._parkingAssignments[pa]===nearest && pa!==pid){occId=pa;break;}
+            }
+            showSpotConflictToast(nearest, occId||'another plane');
+          } else {
+            // Snap to spot
+            var sp2=RAMP_SPOTS[nearest];
+            e.target.setLatLng([sp2.lat,sp2.lng]);
+            e.target._sourceSpot=nearest;
+            updateRampColors();
+          }
         }
       });
       rampMarkers.push(m);
+      // Track what was ACTUALLY rendered so occupancy matches reality
+      if(spotName){renderedSpots[spotName]=safeId;}
     }
-    // Update polygon colors: green=empty, red=occupied
+    // Also render manual planes (from "+ Add Plane" lookup)
+    if(window._manualPlanes){
+      for(var mpk in window._manualPlanes){
+        var mp=window._manualPlanes[mpk];
+        if(!mp||!mp.ident)continue;
+        var mSafe=safeStr(mp.ident).replace(/[^a-zA-Z0-9]/g,'');
+        if(window._manuallyDeparted&&window._manuallyDeparted[mSafe])continue;
+        // Skip if already rendered from FA ground data above
+        var alreadyRendered=false;
+        for(var rmi=0;rmi<rampMarkers.length;rmi++){
+          if(rampMarkers[rmi]._planeId===mSafe){alreadyRendered=true;break;}
+        }
+        if(alreadyRendered)continue;
+        var mSpotName=mp.spot||(window._parkingAssignments&&window._parkingAssignments[mSafe])||'';
+        if(!mSpotName)continue;
+        var mSpot=RAMP_SPOTS[mSpotName];
+        if(!mSpot)continue;
+        var mMdl=MODEL[mp.type]||'';
+        var mIconData={
+          wsFt:SPAN[mp.type]||60,
+          type:mp.type||'',
+          ident:mp.ident||'?',
+          callsign:'',
+          col:'#3b82f6', // blue for manually added
+          borderCol:'#3b82f6',
+          usedAdsb:false,
+          mdl:mMdl,
+          isHeli:HELI[mp.type]?true:false,
+          isManual:true
+        };
+        var mIcon=L.divIcon(buildRampIcon(mIconData));
+        var mM=L.marker([mSpot.lat,mSpot.lng],{icon:mIcon,draggable:true}).addTo(rampMap);
+        mM._planeId=mSafe;mM._planeName=mp.ident;mM._sourceSpot=mSpotName;
+        mM._iconData=mIconData;
+        mM.on('dragstart',function(e){
+          var pid=e.target._planeId;var fromSpot=null;
+          if(window._parkingAssignments&&window._parkingAssignments[pid])fromSpot=window._parkingAssignments[pid];
+          if(!fromSpot)fromSpot=e.target._sourceSpot;
+          e.target._fromSpot=fromSpot;
+        });
+        mM.on('dragend',function(e){
+          var pos=e.target.getLatLng();var nearest='',minDist=9999;
+          for(var sn in RAMP_SPOTS){var spx=RAMP_SPOTS[sn];var dd=Math.sqrt(Math.pow(pos.lat-spx.lat,2)+Math.pow(pos.lng-spx.lng,2));if(dd<minDist){minDist=dd;nearest=sn;}}
+          if(nearest){
+            var pid=e.target._planeId;
+            var ok = assignSpot(pid, nearest, false);
+            if(!ok){
+              // Snap back + toast
+              var srcSpot = e.target._fromSpot || e.target._sourceSpot;
+              var srcSp = srcSpot ? RAMP_SPOTS[srcSpot] : null;
+              if(srcSp) e.target.setLatLng([srcSp.lat, srcSp.lng]);
+              var occId='';
+              for(var pa in window._parkingAssignments){
+                if(window._parkingAssignments[pa]===nearest && pa!==pid){occId=pa;break;}
+              }
+              showSpotConflictToast(nearest, occId||'another plane');
+            } else {
+              var sp2=RAMP_SPOTS[nearest];
+              e.target.setLatLng([sp2.lat,sp2.lng]);
+              e.target._sourceSpot=nearest;
+              if(window._manualPlanes[pid])window._manualPlanes[pid].spot=nearest;
+              updateRampColors();
+            }
+          }
+        });
+        rampMarkers.push(mM);
+        renderedSpots[mSpotName]=mSafe;
+      }
+    }
+    // Build occupancy set from WHAT WAS ACTUALLY RENDERED, not from raw FA data
+    // This ensures red spots always have a visible plane
     window._globalSpotMap={};
     var occupied={};
-    for(var i=0;i<g.length;i++){
-      var f2=g[i];
-      var sid=(f2.ident||'').replace(/[^a-zA-Z0-9]/g,'');
-      var assigned=window._parkingAssignments&&window._parkingAssignments[sid]?window._parkingAssignments[sid]:'';
-      var isH2=HELI[f2.type]?true:false;
-      var sug2=suggestSpot(f2.type,24,isH2,f2.ident);
-      var spotN=assigned||sug2.spot;
-      occupied[spotN]=true;
+    for(var renderedName in renderedSpots){occupied[renderedName]=true;}
+    // Also include any manual drag-assigned occupancy that hasn't been cleared
+    if(window._manualOccupied){
+      for(var mk in window._manualOccupied)if(window._manualOccupied[mk])occupied[mk]=true;
     }
+    // Sync _lastOccupied to match rendered state
+    window._lastOccupied={};
+    for(var rn in renderedSpots){window._lastOccupied[rn]=renderedSpots[rn];}
     for(var pn in rampPolygons){
       var isOcc=!!occupied[pn];
       if(isOcc){
-        rampPolygons[pn].setStyle({color:'#ef4444',fillColor:'#ef4444',fillOpacity:0.15});
+        rampPolygons[pn].setStyle({color:'#ef4444',weight:1,opacity:0.5,fillColor:'#ef4444',fillOpacity:0.05});
       } else {
-        rampPolygons[pn].setStyle({color:'#22c55e',fillColor:'#22c55e',fillOpacity:0.1});
+        rampPolygons[pn].setStyle({color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.06});
       }
       // Update label color
       if(rampLabels[pn]){
@@ -1810,7 +3972,117 @@ function loadRampPlanes(){
         if(lel)lel.style.color=isOcc?'#ef4444':'#22c55e';
       }
     }
+    // Render the unassigned-planes sidebar. These are aircraft we couldn't confidently place
+    // (no manual assignment, no precise ADS-B match). User drags from sidebar onto a spot.
+    renderUnassignedSidebar(unassignedPlanes);
   }).catch(function(e){console.error('Ramp load error:',e);});
+}
+
+// Render the left sidebar showing unassigned aircraft. Each card is HTML5-draggable; on drop
+// onto a ramp spot polygon (or label) the drop handler writes the assignment and re-renders.
+function renderUnassignedSidebar(planes){
+  var listEl=document.getElementById('rampUnassignedList');
+  var countEl=document.getElementById('rampUnassignedCount');
+  if(!listEl||!countEl)return;
+  countEl.textContent=planes.length;
+  if(planes.length===0){
+    listEl.innerHTML='<div style="padding:14px 8px;font-family:var(--mono);font-size:9px;color:var(--t3);text-align:center;font-style:italic">All planes assigned</div>';
+    return;
+  }
+  // Sort: largest wingspan first (heavy iron at the top — staff usually triages those first
+  // because they need bigger/more specific spots), then by most-recent arrival within the same
+  // size tier (newest arrivals are freshest in mind). Planes with no arrival timestamp sort last.
+  planes.sort(function(a,b){
+    if((b.wingspan||0)!==(a.wingspan||0))return (b.wingspan||0)-(a.wingspan||0);
+    return (b.arrMs||0)-(a.arrMs||0);
+  });
+  var html='';
+  for(var i=0;i<planes.length;i++){
+    var p=planes[i];
+    var mdl=MODEL[p.type]||'';
+    var typeLine=p.type?(p.type+(mdl?' · '+mdl:'')):'';
+    // Operator brand pill if known (uses the existing helper)
+    var opPill='';
+    if(typeof opBrandPill==='function'){
+      var op=(typeof getOperator==='function')?getOperator(p.callsign,p.ident):'';
+      if(op)opPill=opBrandPill(op);
+    }
+    var color=p.isHeli?'#22c55e':'#f59e0b';
+    html+='<div class="ramp-unassigned-card" draggable="true" data-plane="'+htmlEsc(p.safeId)+'" data-ident="'+htmlEsc(p.ident)+'" data-type="'+htmlEsc(p.type)+'" data-callsign="'+htmlEsc(p.callsign)+'" data-isheli="'+(p.isHeli?'1':'0')+'" style="background:var(--b1);border:1px solid var(--bd);border-left:3px solid '+color+';border-radius:5px;padding:6px 7px;margin-bottom:4px;cursor:grab;transition:background .12s;font-family:var(--mono)">';
+    html+='<div style="display:flex;align-items:center;gap:4px;font-size:11px;font-weight:800;color:var(--cyan);line-height:1.2">'+htmlEsc(p.ident)+opPill+'</div>';
+    if(p.callsign)html+='<div style="font-size:8px;color:var(--t3);margin-top:1px">'+htmlEsc(p.callsign)+'</div>';
+    if(typeLine)html+='<div style="font-size:8px;color:var(--t2);margin-top:2px">'+htmlEsc(typeLine)+'</div>';
+    if(p.from)html+='<div style="font-size:7px;color:var(--t3);margin-top:1px">from '+htmlEsc(p.from)+'</div>';
+    html+='</div>';
+  }
+  listEl.innerHTML=html;
+  // Wire up drag handlers on each card
+  var cards=listEl.querySelectorAll('.ramp-unassigned-card');
+  cards.forEach(function(card){
+    card.addEventListener('dragstart',function(e){
+      // Stash payload as plain text — the spot drop handler reads it to know which plane was dropped
+      e.dataTransfer.setData('text/plane-id',card.dataset.plane);
+      e.dataTransfer.setData('text/plain',card.dataset.ident);
+      e.dataTransfer.effectAllowed='move';
+      card.style.opacity='0.5';
+      window._draggingFromSidebar={
+        safeId:card.dataset.plane,
+        ident:card.dataset.ident,
+        type:card.dataset.type,
+        callsign:card.dataset.callsign,
+        isHeli:card.dataset.isheli==='1'
+      };
+    });
+    card.addEventListener('dragend',function(e){
+      card.style.opacity='1';
+      // Don't clear _draggingFromSidebar here — the drop handler on the map needs it.
+      // It clears itself after handling.
+    });
+  });
+  // Make sure the map container accepts drops. We attach once; rampMap container is stable across renders.
+  var mapEl=document.getElementById('rampMap');
+  if(mapEl && !mapEl._dropWired){
+    mapEl._dropWired=true;
+    mapEl.addEventListener('dragover',function(e){
+      // Required to allow drop
+      if(window._draggingFromSidebar){e.preventDefault();e.dataTransfer.dropEffect='move';}
+    });
+    mapEl.addEventListener('drop',function(e){
+      e.preventDefault();
+      var dragged=window._draggingFromSidebar;
+      window._draggingFromSidebar=null;
+      if(!dragged||!rampMap)return;
+      // Convert browser drop coordinates to map lat/lng
+      var rect=mapEl.getBoundingClientRect();
+      var pt=L.point(e.clientX-rect.left, e.clientY-rect.top);
+      var latlng=rampMap.containerPointToLatLng(pt);
+      // Find nearest spot to the drop location
+      var nearest='',minD=9999;
+      for(var sn in RAMP_SPOTS){
+        var sp=RAMP_SPOTS[sn];
+        var dd=Math.sqrt(Math.pow(latlng.lat-sp.lat,2)+Math.pow(latlng.lng-sp.lng,2));
+        if(dd<minD){minD=dd;nearest=sn;}
+      }
+      if(!nearest)return;
+      // Route through the single assignment chokepoint. Refuse drops onto occupied spots so two
+      // planes can't end up on the same spot. The user already saw the green spot polygon when
+      // dragging; if it's red they can drop somewhere else or release the existing plane first.
+      var ok = assignSpot(dragged.safeId, nearest, false);
+      if(!ok){
+        var occId='';
+        for(var pa in window._parkingAssignments){
+          if(window._parkingAssignments[pa]===nearest && pa!==dragged.safeId){occId=pa;break;}
+        }
+        showSpotConflictToast(nearest, occId||'another plane');
+        return;
+      }
+      // Re-fetch ramp to show the newly placed plane on the map and remove from sidebar
+      console.log('[RAMP] Assigned',dragged.ident,'→',nearest);
+      // loadRampPlanes() handles the marker cleanup + re-render via the same code path used for
+      // initial load and periodic refresh, so the assignment shows up immediately.
+      if(typeof loadRampPlanes==='function')loadRampPlanes();
+    });
+  }
 }
 function updateRampColors(){
   var occupied=window._lastOccupied||{};
@@ -1820,9 +4092,9 @@ function updateRampColors(){
   }
   for(var pn in rampPolygons){
     if(occupied[pn]){
-      rampPolygons[pn].setStyle({color:'#ef4444',fillColor:'#ef4444',fillOpacity:0.15});
+      rampPolygons[pn].setStyle({color:'#ef4444',weight:1,opacity:0.5,fillColor:'#ef4444',fillOpacity:0.05});
     } else {
-      rampPolygons[pn].setStyle({color:'#22c55e',fillColor:'#22c55e',fillOpacity:0.1});
+      rampPolygons[pn].setStyle({color:'#22c55e',weight:1,opacity:0.4,fillColor:'#22c55e',fillOpacity:0.06});
     }
   }
   if(window._rampLabelMarkers){
@@ -1831,11 +4103,131 @@ function updateRampColors(){
       var occ=occupied[ln];
       var lCol=occ?'#ef4444':'#22c55e';
       var shortN=ln.replace('Airfield Safety','AFS').replace('Ken Salvage','KenS').replace('Btwn Hangars','BH');
-      lm.setIcon(L.divIcon({className:'',html:'<div style="font-family:monospace;font-size:8px;font-weight:800;color:#fff;background:'+lCol+';padding:1px 5px;border-radius:3px;white-space:nowrap;text-align:center;opacity:0.9;cursor:pointer">'+shortN+'</div>',iconSize:[60,12],iconAnchor:[30,6]}));
+      lm.setIcon(L.divIcon({className:'',html:'<div style="font-family:monospace;font-size:7px;font-weight:600;color:#fff;background:'+lCol+';padding:1px 4px;border-radius:2px;white-space:nowrap;text-align:center;opacity:0.7;cursor:pointer;letter-spacing:.2px">'+shortN+'</div>',iconSize:[60,12],iconAnchor:[30,6]}));
     }
   }
 }
 function closeRamp(){document.getElementById('ramp-overlay').style.display='none';}
+
+// === Manual tail number lookup ===
+function openTailLookup(){
+  document.getElementById('tail-lookup-modal').style.display='block';
+  setTimeout(function(){document.getElementById('tailLookupInput').focus();},50);
+  document.getElementById('tailLookupResult').innerHTML='';
+  document.getElementById('tailLookupInput').value='';
+}
+function closeTailLookup(){document.getElementById('tail-lookup-modal').style.display='none';}
+function doTailLookup(){
+  var ident=document.getElementById('tailLookupInput').value.trim().toUpperCase();
+  if(!ident){return;}
+  var rEl=document.getElementById('tailLookupResult');
+  rEl.innerHTML='<div style="color:var(--t3);padding:8px 0">Fetching data from FlightAware...</div>';
+  fetch('/fa/lookup?ident='+encodeURIComponent(ident)).then(function(r){return r.json();}).then(function(d){
+    if(d.error){rEl.innerHTML='<div style="color:var(--red);padding:8px 0">Error: '+htmlEsc(d.error)+'</div>';return;}
+    var html='';
+    // Aircraft info block
+    html+='<div style="background:var(--b0);border:1px solid var(--bd);border-radius:8px;padding:12px;margin-bottom:12px">';
+    html+='<div style="font-size:16px;font-weight:800;color:var(--cyan);margin-bottom:4px">'+htmlEsc(d.ident)+'</div>';
+    if(d.type){
+      var modelName=(typeof MODEL!=="undefined"&&MODEL[d.type])?MODEL[d.type]:(d.model||'');
+      html+='<div style="font-size:12px;color:var(--t1)"><b>'+htmlEsc(d.type)+'</b>'+(modelName?' · '+htmlEsc(modelName):'')+'</div>';
+    } else {
+      html+='<div style="font-size:11px;color:var(--t3);font-style:italic">Aircraft type not found in FlightAware database</div>';
+    }
+    if(d.engineCount&&d.engineType){html+='<div style="font-size:10px;color:var(--t3);margin-top:3px">'+htmlEsc(d.engineCount)+' × '+htmlEsc(d.engineType)+' engines</div>';}
+    html+='</div>';
+    // Last arrival
+    if(d.lastArrival){
+      var la=d.lastArrival;
+      var arrTime=la.actual_in?new Date(la.actual_in):null;
+      html+='<div style="background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:8px;padding:10px;margin-bottom:10px">';
+      html+='<div style="font-size:10px;color:var(--amber);font-weight:700;margin-bottom:4px">⬇ LAST ARRIVAL AT KSFO</div>';
+      html+='<div style="font-size:11px;color:var(--t1)">From <b>'+htmlEsc(la.origin)+'</b>'+(la.originCity?' ('+htmlEsc(la.originCity)+')':'')+'</div>';
+      if(arrTime){html+='<div style="font-size:10px;color:var(--t2);margin-top:3px">Arrived: '+htmlEsc(arrTime.toLocaleString())+'</div>';}
+      html+='</div>';
+    }
+    // Next departure
+    if(d.nextDeparture){
+      var nd=d.nextDeparture;
+      var depTime=nd.scheduled_out?new Date(nd.scheduled_out):null;
+      html+='<div style="background:rgba(220,38,38,.08);border:1px solid rgba(220,38,38,.3);border-radius:8px;padding:10px;margin-bottom:10px">';
+      html+='<div style="font-size:10px;color:var(--red);font-weight:700;margin-bottom:4px">⬆ NEXT DEPARTURE FROM KSFO</div>';
+      html+='<div style="font-size:11px;color:var(--t1)">To <b>'+htmlEsc(nd.destination)+'</b>'+(nd.destinationCity?' ('+htmlEsc(nd.destinationCity)+')':'')+'</div>';
+      if(depTime){html+='<div style="font-size:10px;color:var(--t2);margin-top:3px">Scheduled: '+htmlEsc(depTime.toLocaleString())+'</div>';}
+      html+='</div>';
+    }
+    // Recent flights table
+    if(d.flights&&d.flights.length){
+      html+='<div style="font-size:10px;color:var(--t3);font-weight:700;text-transform:uppercase;margin:12px 0 6px;letter-spacing:.5px">Recent Flights ('+d.flights.length+')</div>';
+      html+='<div style="background:var(--b0);border:1px solid var(--bd);border-radius:6px;overflow:hidden">';
+      for(var i=0;i<d.flights.length;i++){
+        var f=d.flights[i];
+        var fRow=i<d.flights.length-1?'border-bottom:1px solid var(--bd)':'';
+        var t1=f.actual_in?new Date(f.actual_in):(f.estimated_in?new Date(f.estimated_in):(f.scheduled_in?new Date(f.scheduled_in):null));
+        var t1s=t1?t1.toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}):'?';
+        html+='<div style="display:grid;grid-template-columns:70px 70px 1fr 90px;gap:8px;padding:6px 10px;align-items:center;font-size:10px;'+fRow+'">';
+        html+='<div style="color:var(--t1);font-weight:700">'+htmlEsc(f.origin||'?')+'</div>';
+        html+='<div style="color:var(--t1);font-weight:700">→ '+htmlEsc(f.destination||'?')+'</div>';
+        html+='<div style="color:var(--t3);font-size:9px">'+htmlEsc(f.status||'')+'</div>';
+        html+='<div style="color:var(--t2);font-size:9px;text-align:right">'+htmlEsc(t1s)+'</div>';
+        html+='</div>';
+      }
+      html+='</div>';
+    }
+    // Assign to spot button
+    html+='<div style="margin-top:14px;display:flex;gap:8px;align-items:center">';
+    html+='<select id="assignSpotSelect" style="flex:1;font-family:var(--mono);font-size:11px;padding:8px;border:1px solid var(--bd);border-radius:4px;background:var(--b0);color:var(--t1)">';
+    html+='<option value="">— Select a parking spot —</option>';
+    // Generate spot options from SPOT_DEFS if available
+    if(typeof SPOT_DEFS!=="undefined"){
+      for(var si=0;si<SPOT_DEFS.length;si++){
+        var ss=SPOT_DEFS[si];
+        html+='<option value="'+htmlEsc(ss.name)+'">'+htmlEsc(ss.name)+(ss.restricted?' (restricted)':'')+'</option>';
+      }
+    }
+    html+='</select>';
+    // Safer: store ident/type as data attrs + bind listener, no inline onclick with user data
+    var safeIdent=htmlEsc(d.ident);
+    var safeType=htmlEsc(d.type||'');
+    html+='<button id="assignTailBtn" data-ident="'+safeIdent+'" data-type="'+safeType+'" style="background:var(--green);color:#fff;border:none;border-radius:4px;padding:8px 14px;font-family:var(--mono);font-size:11px;font-weight:700;cursor:pointer">Park</button>';
+    html+='</div>';
+    rEl.innerHTML=html;
+    // Bind the Park button via listener (no inline onclick with user data)
+    var btn=document.getElementById('assignTailBtn');
+    if(btn){
+      btn.addEventListener('click',function(){
+        assignTailToSpot(this.getAttribute('data-ident'),this.getAttribute('data-type'));
+      });
+    }
+  }).catch(function(e){
+    rEl.innerHTML='<div style="color:var(--red);padding:8px 0">Lookup failed: '+htmlEsc(e&&e.message?e.message:e)+'</div>';
+  });
+}
+function assignTailToSpot(ident,acType){
+  var spot=document.getElementById('assignSpotSelect').value;
+  if(!spot){alert('Please select a parking spot.');return;}
+  if(!window._manualPlanes)window._manualPlanes={};
+  var pid=ident.replace(/[^a-zA-Z0-9]/g,'');
+  // Try to claim the spot. force=false: if it's already taken, refuse and toast — don't silently
+  // overwrite the existing plane there.
+  var ok = assignSpot(pid, spot, false);
+  if(!ok){
+    var occId='';
+    for(var pa in window._parkingAssignments){
+      if(window._parkingAssignments[pa]===spot && pa!==pid){occId=pa;break;}
+    }
+    showSpotConflictToast(spot, occId||'another plane');
+    return;
+  }
+  // Record the manual plane payload (separate from parking assignment — this is the "where did
+  // this plane come from" data for cards in the ramp view).
+  window._manualPlanes[ident]={ident:ident,type:acType,spot:spot,addedAt:Date.now()};
+  closeTailLookup();
+  if(document.getElementById('ramp-overlay').style.display==='block'){
+    loadRampPlanes();
+  }
+  if(typeof updateRampColors==="function")updateRampColors();
+}
 
 // === 3D AIRSPACE VIEW (Three.js) ===
 var scene3d,camera3d,renderer3d,globe,planeGroup,labelDiv,animId3d=null,cesium3DInterval=null;
@@ -1846,6 +4238,28 @@ function latLonToVec3(lat,lon,alt){
   var theta=(lon+180)*Math.PI/180;
   var r=globeRadius+(alt||0)*0.0003;
   return new THREE.Vector3(-r*Math.sin(phi)*Math.cos(theta),r*Math.cos(phi),r*Math.sin(phi)*Math.sin(theta));
+}
+// Compute initial rotation (in radians) for a Sprite so its "up" edge (icon nose)
+// points toward KSFO in screen space. Uses geographic bearing from plane to KSFO.
+// Sprite rotation is in screen-space radians, counter-clockwise.
+// The icon silhouettes are drawn with nose pointing UP (-y in canvas) → rotation 0 = nose up on screen.
+// We want nose to point toward SFO as seen on screen. Approximate by using geographic bearing
+// and applying it as rotation: bearing 0 (north) = 0 rotation, bearing 90 (east) = -PI/2 rotation.
+function geoBearingToKSFO(lat,lon){
+  var lat1=lat*Math.PI/180;
+  var lat2=37.62818383496824*Math.PI/180;
+  var dLon=(-122.3790-lon)*Math.PI/180;
+  var y=Math.sin(dLon)*Math.cos(lat2);
+  var x=Math.cos(lat1)*Math.sin(lat2)-Math.sin(lat1)*Math.cos(lat2)*Math.cos(dLon);
+  var brng=Math.atan2(y,x); // radians, 0 = north, PI/2 = east
+  return brng;
+}
+function computeScreenBearing(lat,lon){
+  // Sprite rotation: 0 = nose points up on screen; positive = CCW
+  // Geographic bearing 0 = north, PI/2 = east
+  // When camera looks "down from above" with north=up: bearing maps directly (negated because CCW)
+  // The camera tilts around KSFO so the screen-space "up" direction roughly aligns with geographic north
+  return -geoBearingToKSFO(lat,lon);
 }
 function show3D(){
   document.getElementById('cesium-overlay').style.display='block';
@@ -1904,39 +4318,52 @@ function show3D(){
     // Lights
     scene3d.add(new THREE.AmbientLight(0x889aab,1.0));
     var dl=new THREE.DirectionalLight(0xffffff,1.2);dl.position.set(5,3,5);scene3d.add(dl);
-    // KSFO dot
-    var sp=latLonToVec3(37.6213,-122.3790,300);
-    var sm=new THREE.Mesh(new THREE.SphereGeometry(0.35,16,16),new THREE.MeshBasicMaterial({color:0x3b82f6}));
-    sm.position.copy(sp);scene3d.add(sm);
+    // KSFO dot - on the ground, no altitude offset
+    var sp=latLonToVec3(37.62818383496824,-122.38486782258192,0);
+    var sm=new THREE.Mesh(new THREE.SphereGeometry(0.12,12,12),new THREE.MeshBasicMaterial({color:0x3b82f6}));
+    sm.position.copy(sp);sm.renderOrder=20;scene3d.add(sm);
     // KSFO label
     var ksfoLabel=document.createElement('div');
-    ksfoLabel.style.cssText='position:absolute;font:bold 12px monospace;color:#3b82f6;background:rgba(0,0,0,.5);padding:2px 6px;border-radius:3px;pointer-events:none;z-index:51';
+    ksfoLabel.style.cssText='position:absolute;font:bold 10px monospace;color:#fff;background:rgba(59,130,246,.85);padding:2px 6px;border-radius:3px;pointer-events:none;z-index:51;backdrop-filter:blur(2px);transform:translate(-50%,8px)';
     ksfoLabel.textContent='KSFO';
     ctr.appendChild(ksfoLabel);
     window._ksfoLabel=ksfoLabel;window._ksfoPos=sp;
-    // Hi-res OSM tile overlay for Bay Area
-    var tc=document.createElement('canvas');tc.width=2048;tc.height=2048;
+    // Hi-res satellite imagery overlay - LARGER area covering most of US West Coast
+    var tc=document.createElement('canvas');tc.width=8192;tc.height=8192;
     var tx2d=tc.getContext('2d');
-    var tz=10,btx=160,bty=392,gs=8,tld=0,ttl=gs*gs,tsz=tc.width/gs;
+    // At zoom 8: SFO is at tile x=40, y=98. Each tile = ~155km. 24 tiles = ~3700km coverage
+    // Centered on KSFO area, covers from southern OR to northern Mexico, west of Rockies
+    var tz=8,btx=28,bty=86,gs=24,tld=0,ttl=gs*gs,tsz=tc.width/gs;
     for(var tiy=0;tiy<gs;tiy++){for(var tix=0;tix<gs;tix++){(function(txx,tyy){
       var im=new Image();im.crossOrigin='anonymous';
       im.onload=function(){
         tx2d.drawImage(im,txx*tsz,tyy*tsz,tsz,tsz);tld++;
         if(tld>=ttl){
-          tx2d.globalCompositeOperation='difference';tx2d.fillStyle='white';tx2d.fillRect(0,0,2048,2048);
-          tx2d.globalCompositeOperation='source-over';tx2d.fillStyle='rgba(0,0,20,0.25)';tx2d.fillRect(0,0,2048,2048);
+          // Slight dark overlay only (keep landscape visible)
+          tx2d.globalCompositeOperation='source-over';tx2d.fillStyle='rgba(0,15,40,0.2)';tx2d.fillRect(0,0,8192,8192);
           var tt=new THREE.CanvasTexture(tc);tt.anisotropy=renderer3d.capabilities.getMaxAnisotropy();
-          var np=Math.PI-2*Math.PI*bty/Math.pow(2,tz);var sp2=Math.PI-2*Math.PI*(bty+gs)/Math.pow(2,tz);
-          var lN=180/Math.PI*Math.atan(0.5*(Math.exp(np)-Math.exp(-np)));
-          var lS=180/Math.PI*Math.atan(0.5*(Math.exp(sp2)-Math.exp(-sp2)));
-          var lW=btx/Math.pow(2,tz)*360-180;var lE=(btx+gs)/Math.pow(2,tz)*360-180;
-          var sw=64,sh=64,vts=[],uv2=[],idx2=[];
-          for(var iy=0;iy<=sh;iy++){for(var ix=0;ix<=sw;ix++){
-            var u2=ix/sw,v2=iy/sh;var la=lN+(lS-lN)*v2;var lo=lW+(lE-lW)*u2;
-            var ph=(90-la)*Math.PI/180;var th=(lo+180)*Math.PI/180;var rr=globeRadius+0.08;
-            vts.push(-rr*Math.sin(ph)*Math.cos(th),rr*Math.cos(ph),rr*Math.sin(ph)*Math.sin(th));
-            uv2.push(u2,1-v2);
-          }}
+          // Tile Y bounds in Mercator merc-Y space (not lat directly)
+          // Mercator Y for tile row: mercY = π - 2π * row / 2^z
+          var mercN=Math.PI-2*Math.PI*bty/Math.pow(2,tz);
+          var mercS=Math.PI-2*Math.PI*(bty+gs)/Math.pow(2,tz);
+          var lW=btx/Math.pow(2,tz)*360-180;
+          var lE=(btx+gs)/Math.pow(2,tz)*360-180;
+          var sw=128,sh=128,vts=[],uv2=[],idx2=[];
+          for(var iy=0;iy<=sh;iy++){
+            for(var ix=0;ix<=sw;ix++){
+              var u2=ix/sw,v2=iy/sh;
+              // Interpolate Mercator Y linearly, then convert to latitude
+              // This matches how the tile image's pixels are laid out
+              var mercY=mercN+(mercS-mercN)*v2;
+              var la=180/Math.PI*Math.atan(Math.sinh(mercY));
+              var lo=lW+(lE-lW)*u2;
+              var ph=(90-la)*Math.PI/180;
+              var th=(lo+180)*Math.PI/180;
+              var rr=globeRadius+0.08;
+              vts.push(-rr*Math.sin(ph)*Math.cos(th),rr*Math.cos(ph),rr*Math.sin(ph)*Math.sin(th));
+              uv2.push(u2,1-v2);
+            }
+          }
           for(var iy=0;iy<sh;iy++){for(var ix=0;ix<sw;ix++){
             var aa=iy*(sw+1)+ix,bb=aa+1,cc=aa+(sw+1),dd=cc+1;
             idx2.push(aa,cc,bb,bb,cc,dd);
@@ -1946,13 +4373,44 @@ function show3D(){
           pg.setAttribute('uv',new THREE.Float32BufferAttribute(uv2,2));
           pg.setIndex(idx2);pg.computeVertexNormals();
           scene3d.add(new THREE.Mesh(pg,new THREE.MeshBasicMaterial({map:tt})));
-          console.log('[3D] Hi-res tiles loaded');
+          console.log('[3D] Hi-res satellite tiles loaded');
         }
       };
       im.onerror=function(){tld++;};
-      im.src='https://tile.openstreetmap.org/'+tz+'/'+(btx+txx)+'/'+(bty+tyy)+'.png';
+      // ESRI World Imagery - free high-res satellite tiles, uses {y}/{x} order (reversed)
+      im.src='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/'+tz+'/'+(bty+tyy)+'/'+(btx+txx);
     })(tix,tiy);}}
     planeGroup=new THREE.Group();scene3d.add(planeGroup);
+    // === DISTANCE RINGS: 5nm (2min out), 20nm (8min out) ===
+    var sfoLatDome=37.62818383496824,sfoLonDome=-122.38486782258192;
+    var domeSpecs=[
+      {nm:5,color:0x22c55e,op:0.12,time:'2 min'},
+      {nm:20,color:0xf59e0b,op:0.08,time:'8 min'}
+    ];
+    for(var di=0;di<domeSpecs.length;di++){
+      var ds=domeSpecs[di];
+      // Build ring at ground level
+      var rPts=[];
+      for(var deg=0;deg<=360;deg+=3){
+        var rLat=sfoLatDome+(ds.nm/60)*Math.cos(deg*Math.PI/180);
+        var rLon=sfoLonDome+(ds.nm/60/Math.cos(sfoLatDome*Math.PI/180))*Math.sin(deg*Math.PI/180);
+        rPts.push(latLonToVec3(rLat,rLon,100));
+      }
+      var rGeo=new THREE.BufferGeometry().setFromPoints(rPts);
+      var rLine=new THREE.LineLoop(rGeo,new THREE.LineBasicMaterial({color:ds.color,transparent:true,opacity:0.35,linewidth:1}));
+      scene3d.add(rLine);
+      // Floating label for distance + ETA
+      var lblDiv=document.createElement('div');
+      lblDiv.className='dome-label';
+      lblDiv.style.cssText='position:absolute;font-family:monospace;font-size:9px;font-weight:600;padding:2px 6px;border-radius:4px;background:rgba(0,0,0,.45);color:#fff;border-left:2px solid #'+ds.color.toString(16).padStart(6,'0')+';pointer-events:none;white-space:nowrap;z-index:10;transform:translate(-50%,-50%);backdrop-filter:blur(2px)';
+      lblDiv.innerHTML=ds.nm+' nm<br><span style="font-size:8px;font-weight:400;color:#'+ds.color.toString(16).padStart(6,'0')+'">~'+ds.time+' out</span>';
+      ctr.appendChild(lblDiv);
+      // Anchor position: north edge of ring at altitude
+      var anchorLat=sfoLatDome+(ds.nm/60);
+      var anchorPos=latLonToVec3(anchorLat,sfoLonDome,500);
+      if(!window._domeAnchors)window._domeAnchors=[];
+      window._domeAnchors.push({div:lblDiv,pos:anchorPos});
+    }
     // === CONTROLS ===
     var ov=document.getElementById('cesium-overlay');
     ov.addEventListener('wheel',function(ev){
@@ -1975,7 +4433,7 @@ function show3D(){
     });
   }
   // KSFO position on globe
-  var sfoPos=latLonToVec3(37.6213,-122.3790,0);
+  var sfoPos=latLonToVec3(37.62818383496824,-122.38486782258192,0);
   var sfoN=sfoPos.clone().normalize();
   // Build tangent frame at SFO
   var tmpUp=new THREE.Vector3(0,1,0);
@@ -1992,6 +4450,41 @@ function show3D(){
     camera3d.position.copy(camP);
     camera3d.up.copy(sfoN);
     camera3d.lookAt(sfoPos);
+    // Screen-space scaling: keep plane icons at consistent SCREEN size regardless of zoom (FR24-style)
+    // Scale factor = camera distance / reference distance
+    var scaleRef=Math.max(0.5,orbitDist/25);
+    // Pre-project KSFO once for screen-space bearing math below
+    var ctrW=renderer3d.domElement.clientWidth, ctrH=renderer3d.domElement.clientHeight;
+    var sfoProj=sfoPos.clone().project(camera3d);
+    var sfoSx=(sfoProj.x*0.5+0.5)*ctrW, sfoSy=(-sfoProj.y*0.5+0.5)*ctrH;
+    for(var pkk in plane3dData){
+      var pdd=plane3dData[pkk];
+      if(pdd.mesh&&pdd.baseSize){
+        var ss=pdd.baseSize*scaleRef;
+        pdd.mesh.scale.set(ss,ss,1);
+        // Re-orient the sprite so its nose points toward KSFO IN SCREEN SPACE every frame.
+        // The previous code computed a fixed geographic bearing once at creation, which made the
+        // planes appear randomly-oriented as the camera orbited around KSFO. Now we project both
+        // the plane and KSFO to screen, compute the 2D angle between them, and rotate the sprite
+        // accordingly so the nose visually points at SFO from any camera angle.
+        if(pdd.mesh.material && typeof pdd.mesh.material.rotation==='number'){
+          var planeProj=pdd.mesh.position.clone().project(camera3d);
+          if(planeProj.z<1){
+            var planeSx=(planeProj.x*0.5+0.5)*ctrW;
+            var planeSy=(-planeProj.y*0.5+0.5)*ctrH;
+            // Screen vector from plane to SFO
+            var dx=sfoSx-planeSx, dy=sfoSy-planeSy;
+            // Convert to sprite rotation angle:
+            //   - Sprite rotation 0 = nose pointing UP on screen
+            //   - Math.atan2(dy,dx) gives angle from +x axis, where 0 = right, PI/2 = down
+            //   - We want angle relative to UP, increasing CCW
+            //   - So: rotation = -atan2(dx, -dy)  (rotate so "up" maps to the dx,dy vector)
+            // Equivalent derivation: angle of vector (dx,dy) measured CCW from screen-up direction
+            pdd.mesh.material.rotation = -Math.atan2(dx, -dy);
+          }
+        }
+      }
+    }
     renderer3d.render(scene3d,camera3d);
     updateLabels3d();
     // Update KSFO label position
@@ -2004,52 +4497,156 @@ function show3D(){
         window._ksfoLabel.style.display='block';
       } else {window._ksfoLabel.style.display='none';}
     }
+    // Update dome label positions
+    if(window._domeAnchors){
+      for(var dai=0;dai<window._domeAnchors.length;dai++){
+        var da=window._domeAnchors[dai];
+        var dp=da.pos.clone().project(camera3d);
+        if(dp.z<1){
+          var dx=(dp.x*0.5+0.5)*ctr.clientWidth;
+          var dy=(-dp.y*0.5+0.5)*ctr.clientHeight;
+          da.div.style.left=dx+'px';da.div.style.top=dy+'px';
+          da.div.style.display='block';
+        } else {da.div.style.display='none';}
+      }
+    }
   }
   animate3d();
+  // Refresh FA data immediately before first plane load so we have latest inbound list
+  if(typeof buildFaMapSet==="function"){
+    buildFaMapSet();
+    // Give FA fetch ~1.2s to return before first load (fetch+parse typically <800ms)
+    setTimeout(load3DPlanes,1200);
+  } else {
+    load3DPlanes();
+  }
+  // Also kick immediately so something renders even before FA returns
   load3DPlanes();
   if(cesium3DInterval)clearInterval(cesium3DInterval);
-  cesium3DInterval=setInterval(load3DPlanes,10000);
+  // 3D view polls slower than the main refresh to conserve OpenSky credits.
+  // The wide CONUS bbox it uses costs 1 credit/call in OpenSky's pricing, but it still
+  // adds up if the view is left open — 30s interval = 120 cr/hr = 2880/day at worst case.
+  cesium3DInterval=setInterval(load3DPlanes,30000);
 }
 var plane3dData={};
 function load3DPlanes(){
   if(!scene3d||!planeGroup)return;
-  fetch('/osky/states/all?extended=1&'+bboxQS()).then(function(r){return r.json();}).then(function(d){
-    if(!d||!d.states)return;
+  // Wide CONUS + Caribbean + Mexico bbox to catch every inbound flight regardless of distance
+  // This covers all realistic origin points for KSFO arrivals from anywhere in the Western Hemisphere
+  var wideBbox='lamin=15&lomin=-170&lamax=72&lomax=-50';
+  fetch('/osky/states/all?extended=1&'+wideBbox,{cache:'no-cache'}).then(function(r){return r.json();}).then(function(d){
+    if(!d||!d.states){console.warn('[3D] No states data');return;}
+    console.log('[3D] Got '+d.states.length+' aircraft from wide fetch');
     var seen={};
+    var sfoLat=37.62818383496824,sfoLon=-122.38486782258192;
+    var matchCount=0;
     for(var i=0;i<d.states.length;i++){
       var s=d.states[i];var cs=(s[1]||'').trim();
-      var lat=s[6],lon=s[5],alt=s[7]||s[13]||0;
+      var lat=s[6],lon=s[5],alt=s[7]||s[13]||0,gnd=s[8],kts=s[9]||0,cat=s[17]||0;
       if(!lat||!lon)continue;
+      if(gnd)continue;
+      if(alt!=null&&alt<80)continue;
+      if(kts!=null&&kts<30)continue;
       var csUp=cs.toUpperCase().replace(/ /g,'');
       if(!csUp)continue;
-      var fi=faMapSet[csUp];if(!fi)continue;
+      var fi=faMapSet[csUp];
+      // Only show FA-confirmed inbound aircraft to KSFO (regardless of how far out)
+      if(!fi)continue;
+      if(fi.type!=='arr')continue;
+      // Compute distance for per-plane metadata (used in label)
+      var dLat=(lat-sfoLat)*69;
+      var dLon=(lon-sfoLon)*54.6;
+      var distMi=Math.sqrt(dLat*dLat+dLon*dLon);
+      // NO distance cutoff - show every inbound plane from anywhere
+      // ETA window: loose filter only - skip if already landed >45min ago
+      if(fi.arriveISO){
+        var mU=(new Date(fi.arriveISO).getTime()-Date.now())/60000;
+        if(mU<-45)continue;
+      }
+      // Heading check: only skip if plane is DEFINITIVELY heading away (>120° off bearing to SFO)
+      // Relaxed from 100° so far-away planes that route via waypoints still show
+      var trkD=s[10]||0;
+      var brgD=Math.atan2(sfoLon-lon,sfoLat-lat)*180/Math.PI;
+      if(brgD<0)brgD+=360;
+      var diffD=Math.abs(brgD-trkD);if(diffD>180)diffD=360-diffD;
+      if(diffD>140)continue; // very lenient - only skip planes clearly flying away
+      matchCount++;
       seen[csUp]=true;
       var pos=latLonToVec3(lat,lon,alt);
       var col=fi.type==='arr'?0xf59e0b:0xef4444;
+      var colHex=fi.type==='arr'?'#f59e0b':'#ef4444';
+      // Build helper: returns an oriented quaternion so the plane lies flat on the globe surface
+      // AND points toward KSFO (bearing-aligned)
+      function getFlatOrientation(planeLat,planeLon){
+        // Up vector: from globe center through plane position
+        var upVec=new THREE.Vector3(...latLonToVec3(planeLat,planeLon,0).toArray()).normalize();
+        // Forward vector: from plane toward KSFO (geodesically)
+        var sfoVec=new THREE.Vector3(...latLonToVec3(37.62818383496824,-122.38486782258192,0).toArray()).normalize();
+        var planeVec=new THREE.Vector3(...latLonToVec3(planeLat,planeLon,0).toArray()).normalize();
+        // Project SFO direction onto plane's tangent space
+        var fwd=sfoVec.clone().sub(planeVec.clone().multiplyScalar(sfoVec.dot(planeVec))).normalize();
+        // Right vector
+        var right=new THREE.Vector3().crossVectors(upVec,fwd).normalize();
+        // Build rotation matrix (plane's nose along fwd, top along upVec)
+        var m=new THREE.Matrix4().makeBasis(right,fwd,upVec);
+        var q=new THREE.Quaternion().setFromRotationMatrix(m);
+        return q;
+      }
       if(plane3dData[csUp]){
         plane3dData[csUp].mesh.position.copy(pos);
-        plane3dData[csUp].glow.position.copy(pos);
+        plane3dData[csUp].lat=lat;plane3dData[csUp].lon=lon;
+        // (Sprite rotation toward KSFO is now updated every frame in animate3d() based on
+        //  current camera position — no need to set it here on FA refresh.)
         plane3dData[csUp].trail.push(pos.clone());
         if(plane3dData[csUp].trail.length>60)plane3dData[csUp].trail.shift();
         if(plane3dData[csUp].line){planeGroup.remove(plane3dData[csUp].line);plane3dData[csUp].line.geometry.dispose();}
         if(plane3dData[csUp].trail.length>1){
           var tG=new THREE.BufferGeometry().setFromPoints(plane3dData[csUp].trail);
-          plane3dData[csUp].line=new THREE.Line(tG,new THREE.LineBasicMaterial({color:col,transparent:true,opacity:0.5}));
+          plane3dData[csUp].line=new THREE.Line(tG,new THREE.LineBasicMaterial({color:col,transparent:true,opacity:0.8,linewidth:2}));
           planeGroup.add(plane3dData[csUp].line);
         }
         plane3dData[csUp].label=fi.ident||cs;
+        plane3dData[csUp].dist=distMi;
+        plane3dData[csUp].kts=kts*1.94384;
+        plane3dData[csUp].hdg=s[10]||plane3dData[csUp].hdg||0;
+        if(fi.acType)plane3dData[csUp].acType=fi.acType;
       } else {
-        var pm=new THREE.Mesh(new THREE.SphereGeometry(0.25,8,8),new THREE.MeshBasicMaterial({color:col}));
-        pm.position.copy(pos);planeGroup.add(pm);
-        var gm=new THREE.Mesh(new THREE.SphereGeometry(0.5,8,8),new THREE.MeshBasicMaterial({color:col,transparent:true,opacity:0.25}));
+        // Build plane icon using the type-aware icon library
+        // Icons are BILLBOARDED (always face camera) but ROTATED to point toward KSFO
+        // This gives FR24-like appearance: visible from all angles, heading-accurate
+        var pCanvas=document.createElement('canvas');pCanvas.width=128;pCanvas.height=128;
+        var pCtx=pCanvas.getContext('2d');
+        var acTypeForIcon=fi.acType||fi.type||'';
+        drawIconOnCanvas(pCtx,acTypeForIcon,128,colHex);
+        var pTex=new THREE.CanvasTexture(pCanvas);
+        pTex.anisotropy=renderer3d.capabilities.getMaxAnisotropy();
+        // Use Three.js Sprite - always faces camera (billboarded)
+        var pMat=new THREE.SpriteMaterial({map:pTex,transparent:true,depthTest:false,depthWrite:false});
+        var pm=new THREE.Sprite(pMat);
+        var iconSize=0.8;
+        pm.scale.set(iconSize,iconSize,1);
+        pm.renderOrder=10;
+        pm.position.copy(pos);
+        // Compute bearing toward KSFO for initial rotation
+        pm.material.rotation=computeScreenBearing(lat,lon);
+        planeGroup.add(pm);
+        var gm=new THREE.Mesh(new THREE.SphereGeometry(0.01,3,3),new THREE.MeshBasicMaterial({color:col,transparent:true,opacity:0,depthWrite:false}));
         gm.position.copy(pos);planeGroup.add(gm);
-        plane3dData[csUp]={mesh:pm,glow:gm,trail:[pos.clone()],line:null,label:fi.ident||cs,col:col};
+        plane3dData[csUp]={mesh:pm,glow:gm,trail:[pos.clone()],line:null,label:fi.ident||cs,col:col,dist:distMi,kts:kts*1.94384,acType:fi.type||s[2]||'',hdg:s[10]||0,baseSize:iconSize,lat:lat,lon:lon};
       }
     }
     for(var k in plane3dData){
-      if(!seen[k]){planeGroup.remove(plane3dData[k].mesh);planeGroup.remove(plane3dData[k].glow);if(plane3dData[k].line)planeGroup.remove(plane3dData[k].line);delete plane3dData[k];}
+      if(!seen[k]){
+        planeGroup.remove(plane3dData[k].mesh);
+        if(plane3dData[k].mesh.geometry)plane3dData[k].mesh.geometry.dispose();
+        if(plane3dData[k].mesh.material){if(plane3dData[k].mesh.material.map)plane3dData[k].mesh.material.map.dispose();plane3dData[k].mesh.material.dispose();}
+        planeGroup.remove(plane3dData[k].glow);
+        if(plane3dData[k].line)planeGroup.remove(plane3dData[k].line);
+        delete plane3dData[k];
+      }
     }
-  }).catch(function(e){console.error('3D:',e);});
+    console.log('[3D] Showing '+Object.keys(plane3dData).length+' aircraft');
+  }).catch(function(e){console.error('[3D] Fetch err:',e);});
 }
 function updateLabels3d(){
   if(!labelDiv||!camera3d)return;
@@ -2062,18 +4659,76 @@ function updateLabels3d(){
     if(x<-50||x>w+50||y<-50||y>h+50)continue;
     var fi=faMapSet[k];var eta='';
     if(fi&&fi.arriveISO){var m=Math.round((new Date(fi.arriveISO).getTime()-Date.now())/60000);if(m>0)eta=m+'m';else if(m>-5)eta='arriving';else eta='landed';}
-    lbs.push({x:x,y:y,lb:pd.label,eta:eta,c:pd.col});
+    var ac=pd.acType||(fi?fi.type:'')||'';
+    var mdl=(typeof MODEL!=='undefined'&&MODEL[ac])?MODEL[ac]:'';
+    // ix/iy = anchor (where the plane icon is); x/y = label position (will get pushed by collision)
+    lbs.push({x:x,y:y+24,ix:x,iy:y,lb:pd.label,eta:eta,c:pd.col,type:ac,mdl:mdl});
   }
-  for(var p2=0;p2<3;p2++){for(var i=0;i<lbs.length;i++){for(var j=i+1;j<lbs.length;j++){
-    if(Math.abs(lbs[i].x-lbs[j].x)<90&&Math.abs(lbs[i].y-lbs[j].y)<22){
-      var mid=(lbs[i].y+lbs[j].y)/2;lbs[i].y=mid-12;lbs[j].y=mid+12;
+  // Multi-pass label collision avoidance.
+  // Each label is roughly 110px wide × 36px tall (covers 3 lines: tail, type, eta).
+  // Strategy:
+  //   1. If two labels overlap, push them apart vertically (faster: smaller labels move further)
+  //   2. Also push labels away from plane icons that aren't their own (a label shouldn't sit on
+  //      another plane's icon either)
+  //   3. 12 passes are needed because pushing label A away from B may now collide with C.
+  // The result: labels may move 30-80px from their plane, but never overlap each other or icons.
+  var LBL_W=110, LBL_H=36, ICON_R=20;
+  for(var pass=0;pass<12;pass++){
+    var moved=false;
+    // Label-vs-label
+    for(var i=0;i<lbs.length;i++){
+      for(var j=i+1;j<lbs.length;j++){
+        var dx=lbs[i].x-lbs[j].x, dy=lbs[i].y-lbs[j].y;
+        var adx=Math.abs(dx), ady=Math.abs(dy);
+        if(adx<LBL_W && ady<LBL_H){
+          // Push apart vertically (vertical room is usually more available)
+          var pushY=(LBL_H-ady)/2 + 2;
+          if(dy>=0){lbs[i].y+=pushY; lbs[j].y-=pushY;}
+          else     {lbs[i].y-=pushY; lbs[j].y+=pushY;}
+          moved=true;
+        }
+      }
     }
-  }}}
+    // Label-vs-icon (don't sit on top of any plane's icon)
+    for(var i=0;i<lbs.length;i++){
+      for(var j=0;j<lbs.length;j++){
+        if(i===j)continue; // don't push away from own icon (label is meant to be near it)
+        var idx=lbs[i].x-lbs[j].ix, idy=lbs[i].y-lbs[j].iy;
+        var aidx=Math.abs(idx), aidy=Math.abs(idy);
+        if(aidx<(LBL_W/2+ICON_R) && aidy<(LBL_H/2+ICON_R)){
+          var pY=(LBL_H/2+ICON_R-aidy)+2;
+          if(idy>=0)lbs[i].y+=pY;
+          else     lbs[i].y-=pY;
+          moved=true;
+        }
+      }
+    }
+    if(!moved)break;
+  }
   var htm='';
   for(var i=0;i<lbs.length;i++){
-    var l=lbs[i],ch=l.c===0xf59e0b?'#f59e0b':'#ef4444';
-    var et=l.eta?'<br><span style="font-size:7px;color:'+ch+'">'+l.eta+'</span>':'';
-    htm+='<div class="plane-label" data-ident="'+l.lb.replace(/[^a-zA-Z0-9]/g,'')+'" style="left:'+l.x+'px;top:'+l.y+'px;border-left:2px solid '+ch+'">'+l.lb+et+'</div>';
+    var l=lbs[i];
+    var isArr=l.c===0xf59e0b;
+    var ch=isArr?'#f59e0b':'#ef4444';
+    var safeI=safeStr(l.lb).replace(/[^a-zA-Z0-9]/g,'');
+    var typeLine=l.type?'<div style="font-size:8px;color:'+ch+';font-weight:600;margin-top:1px">'+l.type+(l.mdl?' <span style="opacity:.75;font-size:7px">'+l.mdl+'</span>':'')+'</div>':'';
+    var etaLine=l.eta?'<div style="font-size:7px;color:'+ch+';opacity:.85;margin-top:1px">'+l.eta+'</div>':'';
+    // Leader line: SVG line from the plane icon (ix,iy) to the label corner so the user can see
+    // which icon belongs to which label after the collision-avoidance push moves them around.
+    // Only draw if the label has actually moved a notable distance from its plane.
+    var dx=l.x-l.ix, dy=l.y-l.iy;
+    var dist=Math.sqrt(dx*dx+dy*dy);
+    var leader='';
+    if(dist>30){
+      // Position SVG to span from icon to label
+      var minX=Math.min(l.ix,l.x)-10, minY=Math.min(l.iy,l.y)-10;
+      var maxX=Math.max(l.ix,l.x)+10, maxY=Math.max(l.iy,l.y)+10;
+      var sw=maxX-minX, sh=maxY-minY;
+      var x1=l.ix-minX, y1=l.iy-minY;
+      var x2=l.x-minX, y2=l.y-minY;
+      leader='<svg style="position:absolute;left:'+minX+'px;top:'+minY+'px;width:'+sw+'px;height:'+sh+'px;pointer-events:none;z-index:49"><line x1="'+x1+'" y1="'+y1+'" x2="'+x2+'" y2="'+y2+'" stroke="'+ch+'" stroke-width="1" stroke-dasharray="2,2" opacity="0.55"/></svg>';
+    }
+    htm+=leader+'<div class="plane-label" data-ident="'+safeI+'" style="left:'+l.x+'px;top:'+l.y+'px;border-left:2px solid '+ch+';padding:3px 6px;text-align:left;line-height:1.2">'+l.lb+typeLine+etaLine+'</div>';
   }
   labelDiv.innerHTML=htm;
 }
@@ -2102,6 +4757,162 @@ function jumpToFlight(id){
     if(!found){console.log('Flight not found in board:',id);}
   },500);
 }
+function showShiftReport(){
+  document.getElementById('shift-overlay').style.display='block';
+  fetch('/fa/ground').then(function(r){return r.json();}).then(function(g){
+    var now=new Date();
+    var dateStr=now.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});
+    var timeStr=now.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false});
+    var hr=now.getHours();
+    var shift=hr>=6&&hr<14?'Day':hr>=14&&hr<22?'Swing':'Grave';
+    // Group aircraft by assigned line/spot
+    var lineGroups={'Spot A / 1st Line':[],'Ken Salvage':[],'2nd Line':[],'Overflow':[],'Btwn Hangars':[],'3rd Line':[],'The Shop':[],'Airfield Safety':[],'4th Line':[],'41 Area':[],'42 West':[],'The Island':[],'The Fence':[],'Hangars':[],'Unassigned':[]};
+    var lineMap={'Spot A':'Spot A / 1st Line','Spot 1':'Spot A / 1st Line','Spot 2':'Spot A / 1st Line','Spot 3':'Spot A / 1st Line','Spot 4':'Spot A / 1st Line','Spot 5':'Spot A / 1st Line','Ken Salvage':'Ken Salvage','The Shop':'The Shop'};
+    var filtered=[];
+    for(var i=0;i<g.length;i++){
+      var f=g[i];
+      var sid=(f.ident||'').replace(/[^a-zA-Z0-9]/g,'');
+      if(window._manuallyDeparted&&window._manuallyDeparted[sid])continue;
+      var isH=HELI[f.type]?true:false;
+      var shrs=24;
+      if(f.nextDepartISO){var dm=new Date(f.nextDepartISO).getTime();shrs=Math.max(0,(dm-Date.now())/3600000);}
+      var sug=suggestSpot(f.type,shrs,isH,f.ident);
+      var assigned=window._parkingAssignments&&window._parkingAssignments[sid]?window._parkingAssignments[sid]:sug.spot;
+      // Classify into line group
+      var grp='Unassigned';
+      if(lineMap[assigned])grp=lineMap[assigned];
+      else if(assigned.indexOf('2nd Line')>=0)grp='2nd Line';
+      else if(assigned.indexOf('Overflow')>=0)grp='Overflow';
+      else if(assigned.indexOf('Btwn Hangars')>=0)grp='Btwn Hangars';
+      else if(assigned.indexOf('3rd Line')>=0)grp='3rd Line';
+      else if(assigned.indexOf('Airfield Safety')>=0)grp='Airfield Safety';
+      else if(assigned.indexOf('4th Line')>=0)grp='4th Line';
+      else if(assigned.indexOf('41-')>=0)grp='41 Area';
+      else if(assigned.indexOf('42 West')>=0)grp='42 West';
+      else if(assigned==='The Island')grp='The Island';
+      else if(assigned==='The Fence')grp='The Fence';
+      else if(assigned.indexOf('Hangar')>=0)grp='Hangars';
+      f._assigned=assigned;f._group=grp;
+      filtered.push(f);
+      lineGroups[grp].push(f);
+    }
+    // Build HTML report matching paper sheet format
+    var h='<div style="font-family:Arial,sans-serif">';
+    h+='<table style="width:100%;border-collapse:collapse;margin-bottom:12px;font-size:11px">';
+    h+='<tr><td style="border:1px solid #333;padding:4px 8px;background:#f5f5f5;font-weight:700;width:100px">DATE</td><td style="border:1px solid #333;padding:4px 8px">'+dateStr+' '+timeStr+'</td><td style="border:1px solid #333;padding:4px 8px;background:#f5f5f5;font-weight:700;width:80px">SHIFT</td><td style="border:1px solid #333;padding:4px 8px">'+shift+'</td></tr>';
+    h+='<tr><td style="border:1px solid #333;padding:4px 8px;background:#f5f5f5;font-weight:700">COMPUTED BY</td><td style="border:1px solid #333;padding:4px 8px">Signature Skyway</td><td style="border:1px solid #333;padding:4px 8px;background:#f5f5f5;font-weight:700">TOTAL</td><td style="border:1px solid #333;padding:4px 8px;font-weight:700">'+filtered.length+'</td></tr>';
+    h+='</table>';
+    // Main table
+    h+='<table style="width:100%;border-collapse:collapse;font-size:10px;font-family:Arial,sans-serif">';
+    h+='<thead><tr style="background:#e5e7eb"><th style="border:1px solid #333;padding:5px 6px;text-align:left;width:70px">LINE</th><th style="border:1px solid #333;padding:5px 6px">TAIL#</th><th style="border:1px solid #333;padding:5px 6px">AIR TYPE</th><th style="border:1px solid #333;padding:5px 6px">DEP TIME</th><th style="border:1px solid #333;padding:5px 6px">DATE</th><th style="border:1px solid #333;padding:5px 6px">ON LINE</th><th style="border:1px solid #333;padding:5px 6px">STATUS</th><th style="border:1px solid #333;padding:5px 6px">REG CARD</th><th style="border:1px solid #333;padding:5px 6px">FUEL</th><th style="border:1px solid #333;padding:5px 6px">LAV</th><th style="border:1px solid #333;padding:5px 6px">GPU</th><th style="border:1px solid #333;padding:5px 6px">DEST</th></tr></thead>';
+    h+='<tbody>';
+    // Render by line order
+    var lineOrder=['Spot A / 1st Line','Ken Salvage','2nd Line','Overflow','Btwn Hangars','3rd Line','The Shop','Airfield Safety','4th Line','41 Area','42 West','The Island','The Fence','Hangars','Unassigned'];
+    for(var li=0;li<lineOrder.length;li++){
+      var gName=lineOrder[li];var gList=lineGroups[gName];
+      if(!gList||gList.length===0)continue;
+      // Group header row
+      h+='<tr style="background:#1e3a5f;color:#fff"><td colspan="12" style="border:1px solid #333;padding:4px 8px;font-weight:700;font-size:10px;letter-spacing:.5px">'+gName.toUpperCase()+' ('+gList.length+')</td></tr>';
+      for(var ji=0;ji<gList.length;ji++){
+        var fj=gList[ji];
+        var depT=fj.nextDepartISO?new Date(fj.nextDepartISO):null;
+        var depTime=depT?depT.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false}):'TBD';
+        var depDate=depT?(depT.getMonth()+1)+'/'+depT.getDate():'—';
+        var onLine=fj.arrivedISO?new Date(fj.arrivedISO).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false}):'—';
+        var dest=fj.nextDest||'—';
+        var bg=ji%2===0?'#fff':'#f9fafb';
+        // Highlight if departing within next 4hr (like yellow on paper sheet)
+        if(depT){
+          var mUntil=(depT.getTime()-Date.now())/60000;
+          if(mUntil>0&&mUntil<=240)bg='#fef08a';
+        }
+        h+='<tr style="background:'+bg+'">';
+        h+='<td style="border:1px solid #333;padding:4px 6px;font-size:9px;color:#666">'+fj._assigned+'</td>';
+        h+='<td style="border:1px solid #333;padding:4px 6px;font-weight:700">'+fj.ident+'</td>';
+        h+='<td style="border:1px solid #333;padding:4px 6px">'+(fj.type||'—')+'</td>';
+        h+='<td style="border:1px solid #333;padding:4px 6px;font-weight:600">'+depTime+'</td>';
+        h+='<td style="border:1px solid #333;padding:4px 6px">'+depDate+'</td>';
+        h+='<td style="border:1px solid #333;padding:4px 6px">'+onLine+'</td>';
+        h+='<td style="border:1px solid #333;padding:4px 6px">—</td>';
+        h+='<td style="border:1px solid #333;padding:4px 6px;text-align:center">☐</td>';
+        h+='<td style="border:1px solid #333;padding:4px 6px;text-align:center">☐</td>';
+        h+='<td style="border:1px solid #333;padding:4px 6px;text-align:center">☐</td>';
+        h+='<td style="border:1px solid #333;padding:4px 6px;text-align:center">☐</td>';
+        h+='<td style="border:1px solid #333;padding:4px 6px;font-size:9px">'+dest+'</td>';
+        h+='</tr>';
+      }
+    }
+    h+='</tbody></table>';
+    // Expected arrivals section
+    h+='<div style="margin-top:18px">';
+    h+='<div style="background:#1e3a5f;color:#fff;padding:8px 12px;font-weight:700;font-size:11px;letter-spacing:.5px;border-radius:4px 4px 0 0">⏭ EXPECTED ARRIVALS — NEXT 8 HOURS</div>';
+    h+='<div id="shift-expected" style="background:#f9fafb;padding:10px;border:1px solid #ddd;border-top:none;border-radius:0 0 4px 4px;min-height:40px">Loading...</div>';
+    h+='</div>';
+    h+='<div style="margin-top:12px;padding:8px;border-top:1px solid #ccc;font-size:9px;color:#666;font-family:monospace">Generated by Skyway at '+timeStr+' on '+dateStr+' | Yellow highlight = departing within 4hr</div>';
+    h+='</div>';
+    document.getElementById('shift-content').innerHTML=h;
+    // Load expected arrivals as clean table
+    fetch('/fa/arrivals').then(function(r){return r.json();}).then(function(arr){
+      if(!arr){document.getElementById('shift-expected').innerHTML='<div style="color:#888;padding:10px;text-align:center">No data</div>';return;}
+      var exp=[];
+      var now=Date.now();
+      for(var i=0;i<arr.length;i++){
+        var ar=arr[i];
+        if(!ar.arriveISO)continue;
+        var arMs=new Date(ar.arriveISO).getTime();
+        var hrs=(arMs-now)/3600000;
+        if(hrs>0&&hrs<=8)exp.push(ar);
+      }
+      exp.sort(function(a,b){return(a.arriveISO||'').localeCompare(b.arriveISO||'');});
+      if(exp.length===0){document.getElementById('shift-expected').innerHTML='<div style="color:#888;padding:10px;text-align:center;font-style:italic">No expected arrivals in next 8 hours</div>';return;}
+      // Pre-populate spot map with all current ground aircraft so expected arrivals don't collide
+      if(!window._globalSpotMap)window._globalSpotMap={};
+      // Clear and rebuild from scratch (ground aircraft first)
+      var occupiedSpots={};
+      for(var gi=0;gi<filtered.length;gi++){
+        var gf=filtered[gi];
+        if(gf._assigned)occupiedSpots[gf._assigned]=true;
+      }
+      // Now suggest spots for expected arrivals sequentially, deconflicting
+      var eh='<table style="width:100%;border-collapse:collapse;font-size:10px">';
+      eh+='<thead><tr style="background:#e5e7eb"><th style="border-bottom:1px solid #ccc;padding:6px 8px;text-align:left">ETA</th><th style="border-bottom:1px solid #ccc;padding:6px 8px;text-align:left">IN</th><th style="border-bottom:1px solid #ccc;padding:6px 8px;text-align:left">TAIL</th><th style="border-bottom:1px solid #ccc;padding:6px 8px;text-align:left">TYPE</th><th style="border-bottom:1px solid #ccc;padding:6px 8px;text-align:left">FROM</th><th style="border-bottom:1px solid #ccc;padding:6px 8px;text-align:left">SUGGESTED SPOT</th></tr></thead><tbody>';
+      // Temporarily override globalSpotMap to include occupied
+      var savedMap=window._globalSpotMap;
+      window._globalSpotMap={};
+      for(var os in occupiedSpots)window._globalSpotMap[os]=1;
+      for(var j=0;j<exp.length;j++){
+        var ar=exp[j];
+        var arD=new Date(ar.arriveISO);
+        var arT=arD.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false});
+        var mins=Math.round((arD.getTime()-now)/60000);
+        var inStr=mins<60?mins+'m':Math.floor(mins/60)+'h '+(mins%60)+'m';
+        var bg=j%2===0?'#fff':'#f9fafb';
+        var urgColor=mins<=60?'#ef4444':mins<=180?'#f59e0b':'#3b82f6';
+        var isHe=HELI[ar.type]?true:false;
+        // Use realistic stay (not always 2hr) based on aircraft category
+        var arCat=getWsCat(ar.type);
+        var expStay=arCat>=4?24:arCat>=3?8:4;
+        var sug2=suggestSpot(ar.type,expStay,isHe,ar.ident);
+        // Mark that spot as taken for the NEXT arrival suggestion
+        if(sug2.spot)window._globalSpotMap[sug2.spot]=1;
+        eh+='<tr style="background:'+bg+'">';
+        eh+='<td style="padding:5px 8px;font-weight:700;color:'+urgColor+'">'+arT+'</td>';
+        eh+='<td style="padding:5px 8px;font-weight:600;color:'+urgColor+'">'+inStr+'</td>';
+        eh+='<td style="padding:5px 8px;font-weight:700">'+ar.ident+'</td>';
+        eh+='<td style="padding:5px 8px">'+(ar.type||'—')+'</td>';
+        eh+='<td style="padding:5px 8px">'+(ar.from||'—')+(ar.city?' <span style="color:#888;font-size:9px">'+ar.city+'</span>':'')+'</td>';
+        eh+='<td style="padding:5px 8px;color:#0891b2;font-weight:600">'+sug2.spot+(sug2.tow?' → '+sug2.tow:'')+'</td>';
+        eh+='</tr>';
+      }
+      // Restore the original map for other views
+      window._globalSpotMap=savedMap;
+      eh+='</tbody></table>';
+      eh+='<div style="padding:6px 8px;font-size:9px;color:#666;font-style:italic">Red: &lt;1hr · Amber: &lt;3hr · Blue: &lt;8hr</div>';
+      document.getElementById('shift-expected').innerHTML=eh;
+    });
+  }).catch(function(e){document.getElementById('shift-content').innerHTML='<p style="color:red;padding:20px">Error: '+e.message+'</p>';});
+}
+function closeShiftReport(){document.getElementById('shift-overlay').style.display='none';}
 function close3D(){
   document.getElementById('cesium-overlay').style.display='none';
   if(animId3d){cancelAnimationFrame(animId3d);animId3d=null;}
